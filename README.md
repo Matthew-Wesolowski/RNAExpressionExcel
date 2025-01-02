@@ -1,4 +1,2 @@
 # RNAExpressionExcel
-A program to interpret RNA expression data from melanoma samples
-
-coded in python & compiled into executable code using pyinstaller
+A collection of utility functions I wrote and use for analysis of genomics data, expecially microRNA from TCGA databases downloaded from firebrowse
