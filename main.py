@@ -520,7 +520,7 @@ def FastGraphGenes(Igene, Iexpressiontype, Dgene, Dexpressiontype):
     graph.ProcessData()
     graph.PlotData()
 
-# TODO: this is not optimal, this functionality should be housed within the ExpressionDataContainer class
+# TODO: this is very much not optimal, this functionality should be housed within the ExpressionDataContainer class
 def _ExpressionDataVisualizerNavigateRight(container, data, root):
     if data[0] == len(container.Data)-1:
         return
@@ -602,10 +602,13 @@ def _SaveWindow(window, fig, data, filepath):
     
     if filepath is None:
         return
+
+    #draw call for tostring_rgb()
+    fig.canvas.draw()
     
-    buf = fig.canvas.tostring_rgb()
+    buf = fig.canvas.tostring_argb()
     ncols, nrows = fig.canvas.get_width_height()
-    img_array = np.fromstring(buf, dtype=np.uint8).reshape(nrows, ncols, 3)
+    img_array = np.fromstring(buf, dtype=np.uint8).reshape(nrows, ncols, 4)
 
     # save figure size
     figsize = fig.get_size_inches()
@@ -698,7 +701,6 @@ class ExpressionDataContainer:
         # returns a copy
         return ExpressionDataContainer(list(filter(Fn, self.Data)))
 
-    # I don't know why I have these static methods...
     @staticmethod
     def _FilterSmallData(data):
         # filter out data with less than 10 values
@@ -737,6 +739,8 @@ class ExpressionDataContainer:
 
         return None
 
+
+
     # assume predarr is sorted by which most likely targets are first, and least likely are last
     def MatchMiRTargetPredData(self, name, predarr):
         for val in self.Data:
@@ -744,21 +748,46 @@ class ExpressionDataContainer:
                 val.metadata[MIR_PREDICTION_ALGORITHM].append(name)
                 val.metadata[str(name + " priority")] = predarr.index(val.DGene)
 
+
+
     def FilterByPredAlgorithm(self):
         return self.filter(lambda x: len(x.metadata[MIR_PREDICTION_ALGORITHM]) > 0)
 
-    def _FilterAndSaveItems(self, selection):
-        filepath = filedialog.asksaveasfilename(filetypes = [("png file","*.png")], defaultextension= [("png file","*.png")])
+
+
+    def _FilterAndSaveItems(self, child_win, selection):
+        directory = filedialog.askdirectory(title="Select Directory", mustexist=True)
+        print(directory)
         
-        for val in selection:
-            if val[1].get() == True:
-                fig = None
-                ax = None
-                
-                val[1].PlotDataForEmbedded(fig, ax)
-                _SaveWindow(self.tkwindow, fig, val[0], filepath)
+        # temp figure for subplots
+        fig,ax = plt.subplots()
+        
+        for val in selection.curselection():
+            # get index, which are the characters after the " "
+            graphname = selection.get(val)
+            str_idx = graphname.rfind(" ")+1
+
+            data_idx = int(graphname[str_idx:])
+            graphdata = self.Data[data_idx]
+
+            print(data_idx)
             
+            # create file path
+            if directory[-1] != '/':
+                directory += '/'
+
+            # remove tricky characters and build filename
+            temptrans = str.maketrans("", "", "?!.")
+            
+            filepath = directory + graphname[0:str_idx-1].translate(temptrans) + ".png"
+            
+            graphdata.PlotDataForEmbedded(fig, ax)
+
+            print(filepath)
+            
+            _SaveWindow(child_win, fig, graphdata, filepath)
     
+
     def _SaveVisualDialog(self):
         if self.tkwindow is None:
             return
@@ -766,30 +795,29 @@ class ExpressionDataContainer:
         # create child window
         child_win = Toplevel(self.tkwindow)
         child_win.title("Save Dialog")
-
-        optioncanvas = Canvas(child_win)
-        optionframe = Frame(optioncanvas)
-
+        child_win.geometry("600x300")
+        
         # create check buttons for each data
-        checkbutton_vars = [(data, BooleanVar()) for data in self.Data]
-
+        data_strs = [data.IGene + " vs. " + data.DGene + " " + str(index) for index,data in enumerate(self.Data)]
+        
         # create scrollbar
-        scrollbar = Scrollbar(child_win, command=optioncanvas.yview)
-
-        for index,value in enumerate(self.Data):
-            checkbutton = Checkbutton( optionframe, text=value.IGene + " vs. " + value.DGene, variable=checkbutton_vars[index][1] )
-            checkbutton.pack(side=LEFT, fill=Y)
-
-        optioncanvas.pack(side=LEFT, fill="both", expand=True)
+        scrollbar = Scrollbar(child_win, orient='vertical')
         scrollbar.pack(side=RIGHT, fill=Y)
+        
+        listbox = Listbox(child_win, selectmode='multiple', yscrollcommand = scrollbar.set)
+        listbox.pack(padx=10,pady=10,expand=YES,fill="both")
 
-        OKbutton = Button(child_win, text="OK", command=lambda: _FilterAndSaveItems(checkbutton_vars))
-        CancelButton = Button(child_win, text="Cancel", command=lambda: child_win.destroy())
+        for data_str in data_strs:
+            listbox.insert(END, data_str)
         
-        OKbutton.pack(side=BOTTOM, fill=X)
-        CancelButton.pack(side=BOTTOM, fill=X)
         
-        child_win.protocol("WM_DELETE_WINDOW", lambda: _QuitDataViewer(root_win))
+        SaveButton = Button(child_win, text="Save", command=lambda: self._FilterAndSaveItems(child_win, listbox))
+        #CancelButton = Button(child_win, text="Cancel", command=lambda: child_win.destroy())
+        
+        SaveButton.pack(side=BOTTOM, fill=X)
+        #CancelButton.pack(side=BOTTOM, fill=X)
+        
+        child_win.protocol("WM_DELETE_WINDOW", lambda: child_win.destroy())
         
         # display everything
         child_win.mainloop()
@@ -1275,8 +1303,73 @@ def _MirandaGetPredictionSet():
         strdata.append(element.TargetName)
 
     return mirandadata, strdata
+
+genecopoia_URL = "https://www.genecopoeia.com/product/search/result.php?pageNum_Recordset1=0&field=11&tax_id=10090&key=mmu-miR-196b-5p&prt=16&totalRows_Recordset1=252"
+genecopoia_baseURL = "https://www.genecopoeia.com"
+
+def _AuxGenecopiaFindPageIndex(pages, index):
+    for page in pages:
+        try:
+            if (int(page.text) == index): return page
+        except ValueError as ve:
+            continue
+
+# these targets are for mouse, no simple way to navigate site so just provide URL of target query results
+def _GetGenecopiaMMTargets():
+    if GeneDict == {}:
+        print("The gene dictionary is not loaded!")
+        return
     
+    filename = filedialog.askopenfilename()
+    cookies = None
+    returnVal = []
+
+    with open(filename, 'rb') as f:
+        cookies = pickle.load(f)
+
+    c_jar = requests.cookies.RequestsCookieJar()
     
+    for cookie in cookies:
+        c_jar.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
+    
+    r = requests.get(genecopoia_URL,cookies=c_jar)
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    pages = soup.find(class_='pagination').find_all('li')
+    
+    # find total number of pages
+    numpages = int(pages[-1].text)
+    
+    for i in range(2, numpages+1):
+    # for each page (including starting page)
+        
+        #   get body of results
+        table = soup.find(class_="table_org dcf-table dcf-table-responsive dcf-table-bordered dcf-table-striped dcf-w-100%").find_all('tr')
+        pages = soup.find(class_='pagination').find_all('li')
+
+        # skip first row
+        for idx in range(1, len(table)):
+            # get all RNA names given (data-label: "Symbol"), or position 3 in .contents
+            gene = table[idx].contents[3].text.upper()
+            
+            if gene in GeneDict.keys():
+                if GeneDict[gene] in GeneList:        
+                    returnVal.append(GeneDict[gene])
+        
+            
+        #   navigate to next page
+        link = genecopoia_baseURL + _AuxGenecopiaFindPageIndex(pages, i).a['href']
+        
+        #   repeat
+        soup = BeautifulSoup(requests.get(link, cookies=c_jar).text, 'html.parser')
+
+
+    return returnVal
+
+
+
+
 
 # dictionary to match webstites to parser algorithms
 '''Websites = {'MirDB' : WebOperationGroup(_MirDBSubmitRequest, _MirDBParseResponse) , 'PicTar' : WebOperationGroup(_PicTarSubmitRequest, _PicTarParseResponse),
