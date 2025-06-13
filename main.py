@@ -53,6 +53,11 @@ class TCGA_Patient:
     def __init__(self, ID_a):
         self.ID = ID_a
         self.ExpressionData = {}
+        self.ClinicalFeatures = {}
+
+    def AppendClinicalFeature(self, feature, data):
+        self.ClinicalFeatures[feature] = data
+        
     # stores the expression of a certain gene for this patient
     def StoreExpression(self, df, gene_ID):
         #get all columns with name, and then search for our gene of interest, if its not there, error and move on
@@ -171,31 +176,10 @@ def ProgressBarProcess(): # todo: this needs to be a pipe
 
 NumOfProcesses = 4
 def StoreEverything(df):
-    '''with alive_bar(len(df.iloc[1:,0])) as bar:
+    with alive_bar(len(df.iloc[1:,0])) as bar:
         for value in df.iloc[1:,0]:
             StoreGeneForAllPatients(df,value)
-            bar()'''
-    if __name__ == '__main__':
-        mtp.set_start_method("fork", force=True)
-        PrepareJobQueue(df) # this must be here
-        
-        
-        # create the desired number of processes
-        p = Pool( 4 )
-        
-        progressbarproc = Process( target = ProgressBarProcess )
-        print('Processes created')
-
-        print(TargetDataFrame)
-        print(TotalJobs)
-#        progressbarproc.start()
-        p.imap_unordered(ProcessJob, PatientJobQueue)
-        print('Started all processes')
-        
-        p.close()
-        p.join()
- #       progressbarproc.join()
-        CreateGeneListFromDF(df)
+            bar()
 
 def SetDesiredProcesses(num):
     NumOfProcesses = num
@@ -218,6 +202,25 @@ def PrintPatients():
         print(value.ID)
 
 
+def RestorePatientDatas():
+    global TCGA_Patients
+
+    TCGA_Patients.clear()
+
+    root_win = Tk()
+    root_win.withdraw()
+
+    filenames = filedialog.askopenfilenames()
+
+    tempTCGA = []
+    tempGeneList = []
+    tempProcessedData = []
+    
+    for file in filenames:
+        with open(file, 'rb') as f:
+            tempTCGA, tempGeneList, tempProcessedData = pickle.load(f)
+            TCGA_Patients += tempTCGA
+
 def ImportTCGAData(filename):
     df = pd.read_csv(filename)
     df.columns = df.iloc[0]
@@ -237,7 +240,6 @@ def SaveLegacy():
     root_win.withdraw()
 
     filename = filedialog.askopenfilename()
-    
     with open(filename, 'wb') as f:
         pickle.dump((TCGA_Patients, GeneList, ProcessedDataBuffer), f)
 
@@ -294,9 +296,9 @@ def SaveProcessedData():
 
 def RestoreProcessedData():
     global ProcessedDataBuffer
+    global GeneList
     
     GeneList.clear()
-    TCGA_Patients.clear()
     ProcessedDataBuffer.clear()
 
     root_win = Tk()
@@ -330,12 +332,33 @@ def SaveGeneDict():
     f = open(filename, 'wb')
     pickle.write(GeneDict, f)
 
+def SaveTCGAPatients():
+    global TCGA_Patients
+    
+    root_win = Tk()
+    root_win.withdraw()
+    
+    filename = filedialog.asksaveasfilename()
+
+    f = open(filename, 'wb')
+    pickle.dump(TCGA_Patients, f)
+
+def RestoreTCGAPatients():
+    global TCGA_Patients
+    
+    root_win = Tk()
+    root_win.withdraw()
+    
+    filename = filedialog.askopenfilename()
+
+    f = open(filename, 'rb')
+    TCGA_Patients = pickle.load(f)
+
 class SaveDataClass:
     def __init__(self, genelist, processedbuff, patients):
         self.genelist = genelist
         self.processedbuff = processedbuff
         self.patients = patients
-
 
 # for development in interpreter
 def GetSaveData():
@@ -352,7 +375,7 @@ def RestoreSaveData(data):
 
     GeneList = data.genelist
     ProcessedDataBuffer = data.processedbuff
-    TCGA_Patients = data.processedbuff
+    TCGA_Patients = data.patients
 
 # workspace is a compressed cluster of files that contains data on patients, processed regression data, and other things that can be retrieved using the component system class
 #def OpenWorkSpace():
@@ -1368,7 +1391,49 @@ def _GetGenecopiaMMTargets():
     return returnVal
 
 
+def LoadFirebrowseClinicalFeatures():
+    path = filedialog.askopenfilename()
+    
+    # is the file excel or tsv?
+    df = pd.read_csv(path, sep='\t')
+    # create dataframe from excel file (or tsv)
+    global TCGA_Patients
 
+    # for each patient (TCGA-##-####)
+    #   find 'melanoma_ulceration_indicator' row
+    #   append to clinical feature list yes, no, N/A <-- frustrating :(
+    for pt in TCGA_Patients:
+        try:
+            temprow = df[pt.ID.lower()]
+        except:
+            continue
+
+        # set colum headers to their descriptors
+        temprow.index = df['bcr_patient_barcode']
+
+        pt.AppendClinicalFeature("melanoma_ulceration_indicator", temprow["melanoma_ulceration_indicator"])
+
+def UlcerationGraph():
+    # crete matplotib bar graph
+    fig, ax = plt.subplots()
+
+    ulceration_stats = ['yes', 'no']
+
+    counts = [0, 0]
+
+    for pt in TCGA_Patients:
+        if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes':
+            counts[0] += pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')
+            counts[0] = counts[0] / 2
+        elif pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'no':
+            counts[1] += pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')
+            counts[1] = counts[1] / 2
+
+    ax.bar(ulceration_stats, counts)
+    ax.set_ylabel('reads_per_million_miRNA_mapped')
+    ax.set_title('196b expression')
+
+    plt.show()
 
 
 # dictionary to match webstites to parser algorithms
