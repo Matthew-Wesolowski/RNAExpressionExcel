@@ -1419,20 +1419,38 @@ def UlcerationGraph():
 
     ulceration_stats = ['yes', 'no']
 
-    counts = [0, 0]
-
+    colors = [(0, 0, 1, 1), (1, 0, 0, 1)]
+    
+    values = [ [],[] ]
     for pt in TCGA_Patients:
         if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes':
-            counts[0] += pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')
-            counts[0] = counts[0] / 2
+            if pt.CheckGeneDict('hsa-mir-196b', 'reads_per_million_miRNA_mapped'):
+                values[0].append( float(pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')) )
         elif pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'no':
-            counts[1] += pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')
-            counts[1] = counts[1] / 2
+            if pt.CheckGeneDict('hsa-mir-196b', 'reads_per_million_miRNA_mapped'):
+                values[1].append( float(pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')) )
+    err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
 
-    ax.bar(ulceration_stats, counts)
+    counts = [sum(values[0]) / len(values[0]), sum(values[1]) / len(values[1])]
+
+    # normalize to fold change
+    for index,fl in enumerate(values[1]):
+        values[1][index] = fl
+
+    # get fold change of uncerated group
+    for index,fl in enumerate(values[0]):
+        values[0][index] = np.log(fl) / nu_log
+
+    u_log = np.log(counts[0])
+    
+    ax.bar(ulceration_stats, counts, width=0.8)
+    plt.errorbar(ulceration_stats, [u_log, nu_log], yerr=err, fmt="o", color="r")
     ax.set_ylabel('reads_per_million_miRNA_mapped')
     ax.set_title('196b expression')
 
+    for i in range(len(ulceration_stats)):
+         ax.scatter(i + np.random.random(len(values[i])) * .8 - .8 / 2, values[i], color=colors[i])
+    
     plt.show()
 
 
