@@ -89,7 +89,12 @@ class TCGA_Patient:
             if self.ExpressionData[gene_ID].CheckExpressionType(expressiontype):
                 return True
         return False
-    
+
+    def GetClinicalFeature(self, feature):
+        if feature in self.ClinicalFeatures.keys():
+            return self.ClinicalFeatures[feature]
+
+        return None
 TCGA_Patients = []
 GeneList = [] # list of all the stored genes
 ProcessedDataBuffer = []
@@ -445,13 +450,14 @@ class ExpressionData:
     def ProcessData(self):
         # go through each patient, calculate the log of the independent and dependent genes and store them
         for value in TCGA_Patients:
-            #todo: figure out a better way to do this (group genes based off of the way their expression is quantified perhaps?)
+            '''#todo: figure out a better way to do this (group genes based off of the way their expression is quantified perhaps?)
             if value.CheckGeneDict(self.IGene, self.IGeneEtype) and value.CheckGeneDict(self.DGene, self.DGeneEtype):
                 Itemp = float(value.GetExpressionValue(self.IGene, self.IGeneEtype))
                 Dtemp = float(value.GetExpressionValue(self.DGene, self.DGeneEtype))
                 if not Itemp == 0 and not Dtemp == 0:
                     self.IValues.append(np.log2(Itemp))
-                    self.DValues.append(np.log2(Dtemp))
+                    self.DValues.append(np.log2(Dtemp))'''
+            ProcessPatient(value)
 
         if (len(self.IValues) == 0 or len(self.DValues) == 0):
             return
@@ -462,6 +468,25 @@ class ExpressionData:
         self.slope = tempresult.slope
         self.intercept = tempresult.intercept
 
+    def ProcessDataForClinicalFeature(self, feature, val):
+        for value in filter(lambda x: x.GetClincalFeature(feature) == val, TCGA_Patients)
+            ProcessPatient(value)
+
+        if (len(self.IValues) == 0 or len(self.DValues) == 0):
+            return
+
+        self.metadata[feature] = val
+        
+    def ProcessPatient(self, patient):
+        #todo: figure out a better way to do this (group genes based off of the way their expression is quantified perhaps?)
+        if patient.CheckGeneDict(self.IGene, self.IGeneEtype) and patient.CheckGeneDict(self.DGene, self.DGeneEtype):
+            Itemp = float(patient.GetExpressionValue(self.IGene, self.IGeneEtype))
+            Dtemp = float(patient.GetExpressionValue(self.DGene, self.DGeneEtype))
+            if not Itemp == 0 and not Dtemp == 0:
+                self.IValues.append(np.log2(Itemp))
+                self.DValues.append(np.log2(Dtemp))
+                
+    
     def PlotData(self):
         fig, ax = plt.subplots()
         
@@ -689,23 +714,29 @@ def _SaveWindow(window, fig, data, filepath):
 def _QuitDataViewer(root):
     root.quit()
     root.destroy()
-    
+
 # contatiner for data so we can have sort functions that arent global and the like
 class ExpressionDataContainer:
     def __init__(self):
         self.Data = []
         self.tkwindow = None
+        self.metadata = []
 
     def __init__(self, data):
         self.Data = data
-
+        self.metadata = []
+        
     def ImportData(self, data):
         self.Data = data
+        self.metadata = 
+
+    def AppendMetadata(self, data):
         
+    
     @staticmethod
     def CreateFromDefault():
         return ExpressionDataContainer(ProcessedDataBuffer.copy())
-
+        
     # returns container of sorted data from lowest to highest, opposite if inv is true
     def sort(self, Fn, inv=False):
         if not inv:
@@ -763,7 +794,6 @@ class ExpressionDataContainer:
         return None
 
 
-
     # assume predarr is sorted by which most likely targets are first, and least likely are last
     def MatchMiRTargetPredData(self, name, predarr):
         for val in self.Data:
@@ -775,8 +805,6 @@ class ExpressionDataContainer:
 
     def FilterByPredAlgorithm(self):
         return self.filter(lambda x: len(x.metadata[MIR_PREDICTION_ALGORITHM]) > 0)
-
-
 
     def _FilterAndSaveItems(self, child_win, selection):
         directory = filedialog.askdirectory(title="Select Directory", mustexist=True)
@@ -915,6 +943,18 @@ def ProcessAllGenesForIGene(IGene, Iexpressiontype, Dexpressiontype):
             ProcessedDataBuffer.append(tempgraph)
             bar()
 
+# returns an array of processed genes seperated by the category in the clinical feature
+def ProcessGeneForClinicalFeature(IGene, Iexpressiontype, Dexpressiontype, feature):
+    # first iterate through patient data, gather possible clinical feature values
+    featurestates = []
+    for value in filter(lambda x: x.GetClincalFeature(feature) == val, TCGA_Patients)
+        featrestates.append(value.GetClinicalFeature(feature))
+        featurestates = set(featurestates)
+
+    # for each possible value, compute expression data of that group
+
+    
+    
 ''' TODO: CITE THESE DATABASES '''
 
 # one might want to use some prediction algorithms to narrow the search for miRNA's of interest, so thats what were gonna do
@@ -1413,43 +1453,56 @@ def LoadFirebrowseClinicalFeatures():
 
         pt.AppendClinicalFeature("melanoma_ulceration_indicator", temprow["melanoma_ulceration_indicator"])
 
-def UlcerationGraph():
+def UlcerationGraph(Igene):
     # crete matplotib bar graph
     fig, ax = plt.subplots()
 
-    ulceration_stats = ['yes', 'no']
+    ulceration_stats = ['Ulcerated', 'Non-ulcerated']
 
     colors = [(0, 0, 1, 1), (1, 0, 0, 1)]
     
     values = [ [],[] ]
     for pt in TCGA_Patients:
         if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes':
-            if pt.CheckGeneDict('hsa-mir-196b', 'reads_per_million_miRNA_mapped'):
-                values[0].append( float(pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')) )
+            if pt.CheckGeneDict(Igene, 'reads_per_million_miRNA_mapped'):
+                values[0].append( float(pt.GetExpressionValue(Igene, 'reads_per_million_miRNA_mapped')) )
         elif pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'no':
-            if pt.CheckGeneDict('hsa-mir-196b', 'reads_per_million_miRNA_mapped'):
-                values[1].append( float(pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')) )
+            if pt.CheckGeneDict(Igene, 'reads_per_million_miRNA_mapped'):
+                values[1].append( float(pt.GetExpressionValue(Igene, 'reads_per_million_miRNA_mapped')) )
+    
     err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
 
     counts = [sum(values[0]) / len(values[0]), sum(values[1]) / len(values[1])]
-
+    
     # normalize to fold change
-    for index,fl in enumerate(values[1]):
-        values[1][index] = fl
+    nzf_rdpm = counts[1]
 
-    # get fold change of uncerated group
-    for index,fl in enumerate(values[0]):
-        values[0][index] = np.log(fl) / nu_log
+    counts[0] = np.log2(counts[1] / nzf_rdpm)
+    counts[1] = np.log2(1.0)
 
-    u_log = np.log(counts[0])
+    ttestbefore = scipy.stats.ttest_ind(values[0], values[1])
+    
+    for index,val in enumerate(values[0]):
+        values[0][index] = np.log2(val/nzf_rdpm)
+
+    for index,val in enumerate(values[1]):
+        values[1][index] = np.log2(val/nzf_rdpm)
+
+    # calculate standard error of mean
+    err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
     
     ax.bar(ulceration_stats, counts, width=0.8)
-    plt.errorbar(ulceration_stats, [u_log, nu_log], yerr=err, fmt="o", color="r")
+    plt.errorbar(ulceration_stats, [counts[0], counts[1]], yerr=err, fmt="o", color="g")
     ax.set_ylabel('reads_per_million_miRNA_mapped')
-    ax.set_title('196b expression')
+    ax.set_title('196b expression in ulcerated vs non ulcerated Melanoma')
 
     for i in range(len(ulceration_stats)):
          ax.scatter(i + np.random.random(len(values[i])) * .8 - .8 / 2, values[i], color=colors[i])
+
+    ttestafter = scipy.stats.ttest_ind(values[0], values[1])
+
+    print(ttestbefore)
+    print(ttestafter)
     
     plt.show()
 
