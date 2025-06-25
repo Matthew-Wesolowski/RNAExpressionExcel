@@ -134,6 +134,17 @@ def StoreGeneForAllPatients(df, gene_ID):
     
     GeneList.append(gene_ID)
 
+# I don't like this method but atp I don't have a choice :/
+def __CreateGeneListFromPatients():
+    global GeneList
+    
+    with alive_bar(len(TCGA_Patients)) as bar:
+        for pt in TCGA_Patients:
+            for val in pt.ExpressionData.keys():
+                GeneList.append(val)
+                GeneList = list(set(GeneList))
+            bar()
+
 # this needs to be done patient to patient because we modify the patient class
 PatientJobQueue = []
 TotalJobs = 0
@@ -447,6 +458,12 @@ class ExpressionData:
         self.metadata = {}
         self.metadata[MIR_PREDICTION_ALGORITHM] = []
 
+    def GetMetadata(self, key):
+        if key in self.metadata.keys():
+            return self.metadata[key]
+
+        return None
+
     def ProcessData(self):
         # go through each patient, calculate the log of the independent and dependent genes and store them
         for value in TCGA_Patients:
@@ -469,7 +486,7 @@ class ExpressionData:
         self.intercept = tempresult.intercept
 
     def ProcessDataForClinicalFeature(self, feature, val):
-        for value in filter(lambda x: x.GetClincalFeature(feature) == val, TCGA_Patients)
+        for value in filter(lambda x: x.GetClincalFeature(feature) == val, TCGA_Patients):
             ProcessPatient(value)
 
         if (len(self.IValues) == 0 or len(self.DValues) == 0):
@@ -728,10 +745,11 @@ class ExpressionDataContainer:
         
     def ImportData(self, data):
         self.Data = data
-        self.metadata = 
+        self.metadata = data.metadata
 
-    def AppendMetadata(self, data):
-        
+    @staticmethod
+    def CreateForClinicalFeature(feature,val):
+        return ExpressionDataContainter(filter(lambda x: x.GetMetadata(feature) == val, ProcessedDataBuffer.copy()))
     
     @staticmethod
     def CreateFromDefault():
@@ -800,7 +818,6 @@ class ExpressionDataContainer:
             if val.DGene in predarr:
                 val.metadata[MIR_PREDICTION_ALGORITHM].append(name)
                 val.metadata[str(name + " priority")] = predarr.index(val.DGene)
-
 
 
     def FilterByPredAlgorithm(self):
@@ -947,12 +964,22 @@ def ProcessAllGenesForIGene(IGene, Iexpressiontype, Dexpressiontype):
 def ProcessGeneForClinicalFeature(IGene, Iexpressiontype, Dexpressiontype, feature):
     # first iterate through patient data, gather possible clinical feature values
     featurestates = []
-    for value in filter(lambda x: x.GetClincalFeature(feature) == val, TCGA_Patients)
-        featrestates.append(value.GetClinicalFeature(feature))
-        featurestates = set(featurestates)
+    for pt in TCGA_Patients:
+        temp = pt.GetClinicalFeature(feature)
+        if temp is None:
+            continue
+        featurestates.append(temp)
+        featurestates = list(set(featurestates)) # add and then remove duplicates
 
     # for each possible value, compute expression data of that group
-
+    with alive_bar(len(GeneList)) as bar:
+        for featureval in featurestates:
+            for val in GeneList:
+                if IGene == val: continue
+                tempgraph = ExpressionData(IGene, Iexpressiontype, val, Dexpressiontype)
+                tempgraph.ProcessDataForClinicalFeature(feature, featureval)
+                ProcessedDataBuffer.append(tempgraph)
+                bar()
     
     
 ''' TODO: CITE THESE DATABASES '''
