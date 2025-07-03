@@ -29,6 +29,7 @@ from io import StringIO
 from PIL import ImageGrab, ImageFont, Image, ImageDraw
 import mygene
 from copy import deepcopy
+import openpyxl
 
 # use a dictionary and have a text file with defined values
 #TODO: This code is almost a thousand lines long, try to split it up into multiple files...
@@ -82,7 +83,9 @@ class TCGA_Patient:
         self.ExpressionData[gene_ID] = data
     
     def GetExpressionValue(self, gene_ID, expression):
-        return self.ExpressionData[gene_ID].ExpressionValues[expression]
+        if self.CheckGeneDict(gene_ID, expression):
+            return self.ExpressionData[gene_ID].ExpressionValues[expression]
+        return None
 
     def CheckGeneDict(self, gene_ID, expressiontype):
         if gene_ID in self.ExpressionData.keys():
@@ -237,7 +240,9 @@ def RestorePatientDatas():
             tempTCGA, tempGeneList, tempProcessedData = pickle.load(f)
             TCGA_Patients += tempTCGA
 
-def ImportTCGAData(filename):
+def ImportTCGAData():
+    filename = filedialog.askopenfilename()
+    
     df = pd.read_csv(filename)
     df.columns = df.iloc[0]
     df = df[1:]
@@ -1532,8 +1537,59 @@ def UlcerationGraph(Igene):
     print(ttestafter)
     
     plt.show()
+# batch normalization
+def CreateUlcerationWorkbook(mirs, readtypes):
+    savename = filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=(("excel file", "*.xlsx"),("All Files", "*.*") ))
+    
+    #create excel workbook
+    wb = openpyxl.Workbook()
+    # create ulcerated and non ulcerated sheets
+    ulceratedws = wb.create_sheet('Ulcerated')
+    nonulceratedws = wb.create_sheet('Non-Ulcerated')
+    
+    # this is kinda backwards... but it should work
+    # interate through row of each column for each patient and segregate data
+    for index,row in enumerate(ulceratedws.iter_rows(min_row=1, max_row=len(TCGA_Patients)+2, max_col=len(mirs) * len(readtypes)+1)):
+        if index == 0:# title row 1, fill with gene names
+            for gindex,gene in enumerate(mirs):
+                row[gindex * len(readtypes) + 1].value = gene
+            continue
+        elif index == 1:
+            for i in range(1,len(row)):
+                row[i].value = readtypes[(i-1) % len(readtypes)]
+            continue
+        
+        pt = TCGA_Patients[index-2]
+        row[0].value = pt.ID # set index
+        
+        if pt.GetClinicalFeature('melanoma_ulceration_indicator') == 'yes':
+            for gindex,gene in enumerate(mirs):
+                for eindex,expression in enumerate(readtypes):
+                    exprval = pt.GetExpressionValue(gene, expression)
+                    if exprval is not None:
+                        row[gindex*len(readtypes) + eindex + 1].value = str(np.log2(float(pt.GetExpressionValue(gene, expression))))
+    for index,row in enumerate(nonulceratedws.iter_rows(min_row=1, max_row=len(TCGA_Patients)+2, max_col=len(mirs) * len(readtypes)+1)):
+        if index == 0:# title row 1, fill with gene names
+            for gindex,gene in enumerate(mirs):
+                row[gindex * len(readtypes) + 1].value = gene
+            continue
+        elif index == 1:
+            for i in range(1,len(row)):
+                row[i].value = readtypes[(i-1) % len(readtypes)]
+            continue
+        
+        pt = TCGA_Patients[index-2]
+        row[0].value = pt.ID # set index
+        
+        if pt.GetClinicalFeature('melanoma_ulceration_indicator') == 'no':
+            for gindex,gene in enumerate(mirs):
+                for eindex,expression in enumerate(readtypes):
+                    exprval = pt.GetExpressionValue(gene, expression)
+                    if exprval is not None:
+                        row[gindex*len(readtypes) + eindex + 1].value = str(np.log2(float(pt.GetExpressionValue(gene, expression))))
 
-
+    wb.save(savename)
+    
 # dictionary to match webstites to parser algorithms
 '''Websites = {'MirDB' : WebOperationGroup(_MirDBSubmitRequest, _MirDBParseResponse) , 'PicTar' : WebOperationGroup(_PicTarSubmitRequest, _PicTarParseResponse),
             'TargetScan' : WebOperationGroup(_TargetScanSubmitRequest, _TargetScanParseResponse),
