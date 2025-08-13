@@ -33,7 +33,7 @@ import openpyxl
 import umap
 import math
 from sklearn.preprocessing import StandardScaler
-import bioinfokit
+import seaborn
 #from sksurv.nonparametric import kaplan_meier_estimator
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
@@ -1670,12 +1670,17 @@ def GenerateUlcerationHeatmap(expressioncontainer):
     for val in ProcessedDataBuffer:
         if len(val.IValues) < 10 or val.DGene not in df.index:
             continue
+
+        cf = val.GetMetadata('melanoma_ulceration_indicator')
+
+        if cf not in clinicalfeaturemap.keys():
+            continue
         
-        df.at[val.DGene, clinicalfeaturemap[val.GetMetadata('melanoma_ulceration_indicator')]] = val.slope
+        df.at[val.DGene, clinicalfeaturemap[cf]] = val.slope
 
     # scale to unit variance (SD)
-    scaled_data = StandardScaler().fit(df)
-    df = pd.DataFrame(scaled_data, index = df.index, columns = df.columns)
+    #scaled_data = StandardScaler().fit(df)
+    #df = pd.DataFrame(scaled_data, index = df.index, columns = df.columns)
 
     # Normalize each value to the non ulcerated and take the log fold change
     for index,row in df.iterrows():
@@ -1685,12 +1690,16 @@ def GenerateUlcerationHeatmap(expressioncontainer):
             row['ulcerated'] = np.log2(tempU / tempNU)
             row['non-ulcerated'] = 1
         except:
-            row['ulcerated'] = np.nan
-            row['non-ulcerated'] = np.nan
+            df.drop(index)
+
+        if np.isnan(row['ulcerated']):
+            df = df.drop(index)
 
     # visualize with heatmap
     # (only ulcerated because we know non ulcerated is 1)
-    bioinfokit.visuz.gene_exp.hmap(df.loc[:, 'ulcerated'], colclus=False, rowclus=True)
+    seaborn.clustermap(df)
+
+    plt.show()
 
 
 tm_strings = {'DSS': ['DSS_cr', 'DSS.time.cr'], 'PFI': ['PFI.cr', 'PFI.time.cr']}
