@@ -1027,6 +1027,7 @@ def ProcessAllGenesForIGene(IGene, Iexpressiontype, Dexpressiontype):
 # returns an array of processed genes seperated by the category in the clinical feature
 def ProcessGeneForClinicalFeature(IGene, Iexpressiontype, Dexpressiontype, feature):
     global ProcessedDataBuffer
+    ProcessedDataBuffer.clear()
     # first iterate through patient data, gather possible clinical feature values
     featurestates = []
     for pt in TCGA_Patients:
@@ -1054,7 +1055,7 @@ def ProcessGeneForClinicalFeature(IGene, Iexpressiontype, Dexpressiontype, featu
 ''' TODO: CITE THESE DATABASES '''
 
 # one might want to use some prediction algorithms to narrow the search for miRNA's of interest, so thats what were gonna do
-_PicTarRequestURL = 'https://pictar.mdc-berlin.de/cgi-bin/PicTar_vertebrate.cgi'
+#_PicTarRequestURL = 'https://pictar.mdc-berlin.de/cgi-bin/PicTar_vertebrate.cgi'
 '''def _PicTarSubmitRequest(miRNA):
     #TODO: gotta captialize the r in miR or else the request won't recognize it
     
@@ -1402,7 +1403,7 @@ def ReadMirandaOutFile():
             
             index = index+2 # set position to start of next name
 
-            temp = data.find('\t', index, fend)
+            #temp = data.find('\t', index, fend)
             mirdata.MirName = data[index:temp]
 
             index = temp+1
@@ -1425,8 +1426,8 @@ def ReadMirandaOutFile():
                 bar()
                 barpos = barpos+1
     
-    # sort based on free energy
-    returnVal.sort(key=lambda x : x.TotalEnergy)
+    # sort based on score energy
+    returnVal.sort(key=lambda x : x.TotalScore, reverse=True)
     return returnVal
 
 RefseqConversionTable = None
@@ -1675,30 +1676,33 @@ def GenerateUlcerationHeatmap(expressioncontainer):
 
         if cf not in clinicalfeaturemap.keys():
             continue
+
+        if val.pval > 0.1 or len(val.IValues) < 30:
+            continue
         
         df.at[val.DGene, clinicalfeaturemap[cf]] = val.slope
 
     # scale to unit variance (SD)
-    #scaled_data = StandardScaler().fit(df)
-    #df = pd.DataFrame(scaled_data, index = df.index, columns = df.columns)
-
+    #scaled_data = StandardScaler().fit_transform(df.transpose())
+    #df = pd.DataFrame(scaled_data.transpose(), index = df.index, columns = df.columns)
     # Normalize each value to the non ulcerated and take the log fold change
     for index,row in df.iterrows():
-        tempU = row['ulcerated']
+        '''tempU = row['ulcerated']
         tempNU = row['non-ulcerated']
         try:
             row['ulcerated'] = np.log2(tempU / tempNU)
             row['non-ulcerated'] = 1
         except:
             df.drop(index)
-
         if np.isnan(row['ulcerated']):
+            df = df.drop(index)'''
+        if abs(row['ulcerated'] - row['non-ulcerated']) < 0.4:
             df = df.drop(index)
 
+    print(df.index.tolist())
     # visualize with heatmap
     # (only ulcerated because we know non ulcerated is 1)
-    seaborn.clustermap(df)
-
+    seaborn.clustermap(df, z_score=None, standard_scale=None, yticklabels=True)
     plt.show()
 
 
@@ -1841,7 +1845,70 @@ def SurvivalCurve196(percentile_low, percentile_high, timemetric):
 
         
     # remove columns with zero or leave it
+
+#TODO: target 
+def _psRNATargetGetPredictionSet():
+    df = pd.read_csv(filedialog.askopenfilename(defaultextension='.txt', filetypes=(("psRNATarget text output", "*.txt"),("All Files", "*.*"))), sep='\t')
+    temp = df['Target_Acc.'].tolist()
+
+    returnval = []
+    for val in temp:
+        # first word is the gene ID
+        genestr = temp[val.find('|')+1:]
+
+        if val in GeneDict.keys():
+            returnval.append(GeneDict[val])
+
+    return returnval;
+
+def _MirTarBaseGetPredictionSet():
+    df = pd.read_csv( filedialog.askopenfilename(defaultextension='.csv', filetypes=(("comma seperated values file", "*.csv"),("All Files", "*.*"))) )
+    temp = df['Target'].tolist()
+    global GeneDict
+    returnval = []
+    for val in temp:
+        if type(val) is not str:
+            continue
+
+        if val in GeneDict.keys():
+            returnval.append(GeneDict[val])
+
+    return returnval
+
+def GenerateExcelOfPredTar(mirna):
+    TargetScan = _TargetScanGetPredictionSet(mirna)
+    mir_db = _MirDBGetPredictionSet(mirna)
+    mirtar = _MirTarBaseGetPredictionSet()
+    psrnatar = _psRNATargetGetPredictionSet()
+
+    algorithms = {'TargetScan' : TargetScan, 'mirDB' : mir_db, 'MirTarBase' : mirtar, 'psRNATarget' : psrnatar}
+    global GeneDict
+    genes = GeneDict.values()
+
+    lists = [{}, {}, {}, {}]
     
+    for gene in genes:
+        numalgs = 0
+        agg = 0
+        for key,value in algorithms.items():
+            if gene in value:
+                numalgs += 1
+                agg += value.index(gene)
+        if gene == 'TSPAN12|23554':
+            print("numalgs: %i agg: %i", numalgs, agg)
+        
+        if not numalgs == 0:
+           lists[numalgs-1][gene] = agg
+
+    wb = openpyxl.Workbook()
+    for idx,genedict in enumerate(lists):
+        genedict = dict(sorted(genedict.items(), key=lambda item: item[1]))
+        ws = wb.create_sheet(f"{idx+1} prediction algorithms")
+        for key in genedict.keys():
+            ws.append([key])
+
+    wb.save(filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=(("excel file", "*.xlsx"),("All Files", "*.*") )))
+
     
 # dictionary to match webstites to parser algorithms
 '''Websites = {'MirDB' : WebOperationGroup(_MirDBSubmitRequest, _MirDBParseResponse) , 'PicTar' : WebOperationGroup(_PicTarSubmitRequest, _PicTarParseResponse),
