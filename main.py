@@ -1,3 +1,5 @@
+# ver DEV 02/12/2026
+
 import pandas as pd
 from dataclasses import dataclass
 import string
@@ -12,7 +14,7 @@ from alive_progress import alive_bar
 import multiprocessing as mtp
 from multiprocessing import Queue
 from multiprocessing import Pool
-from multiprocessing import Process
+from multiprocessing import Process, Manager
 import time
 import traceback
 import tkinter as tk
@@ -33,11 +35,24 @@ import openpyxl
 import umap
 import math
 from sklearn.preprocessing import StandardScaler
-import seaborn
+from sklearn.model_selection import train_test_split
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+import seaborn as sns
 #from sksurv.nonparametric import kaplan_meier_estimator
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
 from lifelines.datasets import load_waltons
+import os
+import GEOparse
+from goatools.anno.idtogos_reader import IdToGosReader
+from goatools.go_enrichment import GOEnrichmentStudy
+from goatools.obo_parser import GODag
+import randomcolor
+
+import anndata as ad
+
+import pdb
 
 # use a dictionary and have a text file with defined values
 # TODO: This code is almost a thousand lines long, try to split it up into multiple files... <-- this first I guess
@@ -46,10 +61,39 @@ from lifelines.datasets import load_waltons
 # TODO: More functionality! Class to interpret TCGA barcode, include sequencing and methylated regions, etc.
 
 # TODO: train a classifier to segregate the N/A ulceration data
+# TODO: Rework saving to account for duplicates!
+# TODO: Include full barcode in each expression container (analayte)
+
+# TODO: Come up with some sort of way to organize your code & save data w/ versioning dummy
+
+# TODO: Come up with a system to make user input for expression keys easier, I don't want to have to
+#       look up the keys in the original data every time I reprocess
+
+# TODO: Isolate contexts in which mir-196b is highly expressed and has poor outcomes (ulceration, PFI, DSS)
+
+'''
+    *.*.*:
+    first number contains major changes to the saving and data processing that cannot be migrated without reprocessing the original data
+    second number means changes to the objects being saved and restored and is incompatable with previous binaries, meaning the data has to be migrated in order to be used with the newest version
+    third number means any changes to data processing, user interfacing, and other changes that do not affect compatability with save binaries. Data can be moved seamlessly between these versions without migration
+'''
 TCGA_PATIENT_ID_START = 0
 TCGA_PATIENT_ID_END = 12
 
 MIR_PREDICTION_ALGORITHM = 'MIR_PREDICTION_ALGORITHM'
+
+def FixPatientKeys():
+    global TCGA_Patients
+    
+    with alive_bar(len(TCGA_Patients)) as bar:
+        for pt in TCGA_Patients:
+            for key,exp in pt.ExpressionData.items():
+                if len(exp.ExpressionValues) == 1:
+                    temp = list(exp.ExpressionValues.keys())[0]
+                    exp.ExpressionValues['normalized_count'] = list(exp.ExpressionValues.values())[0]
+
+                    del exp.ExpressionValues[temp]
+            bar()
 
 class TCGA_ExpressionData:
     def __init__(self):
@@ -82,38 +126,59 @@ class ClinicalData:
         #self.follow_ups <-- deal with this later
 
 
+def _HandleMergeExpressionConflicts(gene : str, classexpr : str, expr : str) -> None:
+    print(f"A merge conflict was detected for gene: {gene}, for expression values: {classexpr}, {expr} (calling class expr is first)")
+
 class TCGA_Patient:
     def __init__(self, ID_a):
         self.ID = ID_a
         self.ExpressionData = {}
         self.ClinicalFeatures = {}
 
-        #sequencing data too
-
+        self.EpigeneticData = {}
+    
     def AppendClinicalFeature(self, feature, data):
         if feature not in self.ClinicalFeatures.keys():
             self.ClinicalFeatures[feature] = data
-        
+    
     # stores the expression of a certain gene for this patient
     def StoreExpression(self, df, gene_ID):
+        if (gene_ID == 'miRNA_ID'):
+            # this is kinda cheaty but should work
+            return
+        
         #get all columns with name, and then search for our gene of interest, if its not there, error and move on
         ''' Its a bit ugly, but it works, the  boolean array selects the first row so that we can have
             the type of expression data for the dictionary'''
+        if gene_ID in self.ExpressionData.keys():
+            # already have record of this gene, complain to the user
+            print(f'Gene: {gene} for patient ID: {self.ID} is already present with expression data, how would you like to handle the conflict?')
+            return # return for now since this doesn't seem to be a problem
+
         genedata = df.filter(regex=self.ID)
         if (genedata.empty):
             return
-        
-        genedata = genedata.loc[(df.iloc[:,0] == gene_ID) | np.array(([True] + [False] * (len(df)-1)))]
+
+        exprtypeidx = df.index.get_loc(1) # expression type MUST to have loc of 0
+        exparr = np.array(([False] * (len(df))))
+        exparr[exprtypeidx] = True
+                
+        genedata = genedata.loc[(df.iloc[:,0] == gene_ID) | exparr]
         if genedata.isnull().values.any() or len(genedata.index) < 2:
             return
             ''' TODO: temporary,ideally you would want
                 to still store the other values
                 THIS IS TEMPORARY PLS CHANGE EVENTUALLY'''
+        
         data = TCGA_ExpressionData()
         data.gene_ID = gene_ID
+
+        # get row with data
+        dataloc = df[df['Hybridization'] == gene_ID].index[0]
+        
         for val in range(len(genedata.columns)):
             temp = genedata.iloc[:,val]
-            data.ExpressionValues[temp.iloc[0]] = temp.iloc[-1]
+            data.ExpressionValues[temp.loc[1]] = temp.loc[dataloc]
             
         self.ExpressionData[gene_ID] = data
     
@@ -133,31 +198,86 @@ class TCGA_Patient:
             return self.ClinicalFeatures[feature]
 
         return None
+    
+    def RemoveClinicalFeature(self, feature):
+        if feature in self.ClinicalFeatures.keys():
+            del self.ClinicalFeatures[feature]
+    
+    #combines data in dictionary
+    def MergePatientExpressionData(self, pt):
+        # union operator has first argument as priority for duplicates, which is what we want because technically, the values should be the same...
+        merged = self.ExpressionData | pt.ExpressionData
+
+        # include only duplicate values in sets
+        for k in set(self.ExpressionData.keys()) & set(pt.ExpressionData.keys()):
+            # if there are duplicates, check for conflicts
+            if self.ExpressionData[k] != pt.ExpressionData[k]:
+                _HandleMergeExpressionConflicts(k, self.ExpressionData[k], pt.ExpressionData[k])
+                print("Abandoning merge!")
+
+        self.ExpressionData = merged
+
+    def MergePatientFeatureData(self, pt):
+        # union operator has first argument as priority for duplicates, which is what we want because technically, the values should be the same...
+        merged = self.ClinicalFeatures | pt.ClinicalFeatures
+
+        # include only duplicate values in sets
+        for k in set(self.ClinicalFeatures.keys()) & set(pt.ClinicalFeatures.keys()):
+            # if there are duplicates, check for conflicts
+            if self.ClinicalFeatures[k] != pt.ClinicalFeatures[k]:
+                _HandleMergeExpressionConflicts(k, self.ClinicalFeatures[k], pt.ClinicalFeatures[k])
+                print("Abandoning merge!")
+
+        self.ClinicalFeatures = merged
+
+    def MergePatientData(self, pt):
+        self.MergePatientExpressionData(pt)
+        self.MergePatientFeatureData(pt)
+
 TCGA_Patients = []
 GeneList = [] # list of all the stored genes
 ProcessedDataBuffer = []
 GeneDict = {}
 
-def CheckPatientDuplicates(TGCA_Barcode):
+# ughhh, barcode tells us if the passed value is formatted as an analayte barcode, or a patient ID
+def CheckPatientDuplicates(TCGA_Barcode, ptlist = None, barcode=True):
+    global TCGA_Patients
+
+    if ptlist is None:
+        ptlist = TCGA_Patients
+    
     # checks for patient duplicates in array
-    for value in TCGA_Patients:
-        if (value.ID == GetPatientID(TGCA_Barcode)):
-            return True
+    if barcode:
+        for value in ptlist:
+            if value.ID == GetPatientID(TCGA_Barcode):
+                return True
+    else:
+        for value in ptlist:
+            if value.ID == TCGA_Barcode:
+                return True
     return False
 
 # create TCGA patients off of a dataset
 # TODO: other functions to add or remove patients
-def CreateTCGAPatients(df):
+def CreateTCGAPatients(df, ptlist = None):
     # for now just use second row from top for names
     #namelist = df.loc[[0]].squeeze()
     #namelist = namelist.iloc[3:]
     namelist = df.columns[2:]
     
     for value in namelist:
-        if (not CheckPatientDuplicates(value)):
-            TCGA_Patients.append( TCGA_Patient( GetPatientID(value) ) )
+        if (not CheckPatientDuplicates(value, ptlist=ptlist)):
+            if ptlist is None:
+                TCGA_Patients.append( TCGA_Patient( GetPatientID(value) ) )
+            else:
+                ptlist.append( TCGA_Patient( GetPatientID(value) ) )
+            
+def GetPatient(ID, ptlist=None):
+    global TCGA_Patients
 
-def GetPatient(ID):
+    if ptlist is None:
+        ptlist = TCGA_Patients
+    
     for value in TCGA_Patients:
         if (value.ID == ID):
             return value
@@ -172,10 +292,23 @@ def StoreGeneForAllPatients(df, gene_ID):
     
     GeneList.append(gene_ID)
 
+def StorePatientDatas(pts, ptlist=None):
+    global TCGA_Patients
+
+    if ptlist is None:
+        ptlist = TCGA_Patients
+    
+    # check if there are duplicates
+    for pt in pts:
+        value = GetPatient(pt.ID,ptlist)
+        if value is not None:
+            GetPatient(pt.ID).MergePatientData(pt)
+        else:
+            ptlist.append(pt)
+            
 # I don't like this method but atp I don't have a choice :/
 def __CreateGeneListFromPatients():
-    global GeneList
-
+    global GeneLis
     GeneList.clear()
 
     with alive_bar(len(TCGA_Patients)) as bar:
@@ -185,82 +318,177 @@ def __CreateGeneListFromPatients():
                     GeneList.append(val)
             bar()
 
-# this needs to be done patient to patient because we modify the patient class
-PatientJobQueue = []
-TotalJobs = 0
-JobsDone = 0
-UpdatedJobs = 0
+#TODO: tk window to show current gene being stored
+def SubStoreEverything(df, counter, lock, ptlist):
+    templist = []
+    CreateTCGAPatients(df, templist)
+    for value in df.iloc[:,0]:
+        #print(value)
+        for pt in templist:
+            pt.StoreExpression(df, value)
 
-GlobalLock = mtp.Lock()
-TargetDataFrame = None
+        lock.acquire()
+        counter.value += 1
+        lock.release()
 
-def GetNextJob():
-    return PatientJobQueue.get()
+    lock.acquire()
+    StorePatientDatas(templist, ptlist)
+    lock.release()
 
-def UpdateJobsProgress():
-    GlobalLock.acquire()
-    UpdatedJobs += 1
-    GlobalLock.release()
+def UI_Updater(barcounters, progress_counters, lock, win, totalitems):
+    # update progress counter
+    lock.acquire()
+    totalcounter = 0
+    for idx,bc in enumerate(barcounters):
+        #print(bc.value)
+        progress_counters[idx].set(bc.value)
+        totalcounter += bc.value
 
-def ProcessJob(ID):
-    try:
-        print("Starting process")
+    lock.release()
+    if totalcounter >= totalitems:
+        win.quit()
+        win.destroy()
+        return
+
+    win.update_idletasks()
+    win.after(100, UI_Updater, barcounters, progress_counters, lock, win, totalitems)
+
+# TODO: user exit behavior
+
+def StoreEverything(numprocs = 4):
+    if numprocs > os.cpu_count():
+        print(f"Input {numprocs} core count when cpu count is {os.cpucount()}!")
+        return
+    elif numprocs > os.cpu_count() / 2:
+        print(f"Core count {numprocs} is greater than half of cpu count!")
+
+    df = ImportTCGAData()
     
-        print(ID)
-        patient = GetPatient( ID )
-        for value in df.iloc[1:,0]:
-            patient.StoreExpression(df, value)
-    except Exception as e:
-        traceback.print_exc()
+    #df = ImportTCGAData().iloc[:50] # temporary for fast processing for dev
     
- #   UpdateJobsProgress()
-
-def UpdateProgressBar(barfunc):
-    GlobalLock.acquire()
-    while UpdatedJobs > 0:
-        barfunc()
-        JobsDone += 1
-        UpdatedJobs -= 1
-    GlobalLock.release()
-
-def ProgressBarProcess(): # todo: this needs to be a pipe
-    print("progress bar starting")
-    with alive_bar(TotalJobs) as bar:
-        while TotalJobs > JobsDone:
-            time.sleep(0.4)
-            UpdateProgressBar(bar)
-
-NumOfProcesses = 4
-def StoreEverything(df):
-    with alive_bar(len(df.iloc[1:,0])) as bar:
-        for value in df.iloc[1:,0]:
-            StoreGeneForAllPatients(df,value)
-            bar()
-
-def SetDesiredProcesses(num):
-    NumOfProcesses = num
-
-def PrepareJobQueue(df):
-    global TotalJobs
-    global JobsDone
-    global UpdatedJobs
-    global TargetDataFrame
+    print(f"Number of Processes: {numprocs}")
     
-    for value in df.columns:
-        PatientJobQueue.append( GetPatientID(value) )
-    print("Job Queue progress check")
+    tmprow = df.iloc[0]
     
-    TotalJobs = len(PatientJobQueue)
-    TargetDataFrame = df
+    df = df.iloc[1:]
+    
+    values = df.iloc[1:,0].tolist()
+
+    print("Loaded file")
+    
+    # split everything up into numproc dfs
+    
+    factor = len(df.index) // numprocs
+
+    subdfs = []
+    for i in range(0,numprocs-1):
+        subdfs.append(df.iloc[i*factor:(i+1)*factor].copy())
+        subdfs[i].loc[1] = tmprow
+        print(subdfs[i])
+        
+    subdfs.append(df.iloc[factor*(numprocs-1):].copy())
+    subdfs[-1].loc[1] = tmprow
+    print(subdfs[-1])
+    
+    print("Divided data")
+    
+    with Manager() as manager:
+        barcounters = [mtp.Value('i', 0) for idx in range(numprocs)]
+        
+        ptlist = manager.list()
+        lock = mtp.Lock()
+
+
+        procs = [Process(target=SubStoreEverything, args=(s,barcounters[idx],lock,ptlist,)) for idx,s in enumerate(subdfs)]
+        #procs = [Process(target=SubStoreEverything, args=(s,barcounter,lock,ptlist,)) for s in subdfs]
+
+        print("Created Processes")
+        
+        # create TKwindow
+        root = tk.Tk()
+        root.title("Progress")
+
+        # create progressbar for each
+        progress_counters = [tk.DoubleVar() for idx in range(numprocs)]
+        progress_bars = [Progressbar(root, orient='horizontal', mode='determinate', variable=progress_counters[idx], maximum=len(s.index)) for idx,s in enumerate(subdfs)]
+        
+        for pb in progress_bars:
+            pb.pack(pady=10, padx=20)
+        
+        #UIProc = Process(target=UI_Updater, args=(barcounters, progress_counters, lock, root,))
+        print("Created UI")
+
+        print("Running Processes...")  
+        for p in procs:
+            p.start()
+
+        print("Finished")
+        #UIProc.start()
+
+        totalitems = len(df.iloc[1:,0])
+
+        root.after(10, UI_Updater, barcounters, progress_counters, lock, root, totalitems)
+
+        print("Running UI...")
+
+        root.mainloop()
+
+        print("Finished Processing!")
+        
+        #with alive_bar(len(df.iloc[1:,0])) as bar:
+        #localcounter = [0] * len(barcounters)
+        '''totalcoutner = 0
+        while(True):
+            # check for change in counter
+            lock.acquire()
+
+            #for idx,bc in enumerate(barcounters):
+             #   if bc.value > localcounter:
+             #       while(localcounter != barcounter.value):
+              #          #bar()
+              #          localcounter[idx] += 1
+               #         progress_counters[idx] += 1
+            
+            totalcounter = 0
+            for idx,bc in enumerate(barcounters):
+                progress_counters[idx].set(bc.value)
+                totalcoutner += bc.value
+            
+            lock.release()
+
+            if totalcounter == len(df.iloc[1:,0]):
+                break
+
+            root.update_idletasks()
+            time.sleep(0.5)'''
+        
+        print("Waiting on worker procs...")
+        for p in procs:
+            p.join()
+
+        print("Loading into memory...")
+        StorePatientDatas(ptlist)
+
+        print("done.")
+
+
+def GetAnnData():
+    # get ann data object patient list
+    global TCGA_Patients
+    
+
+    
+
 
 def PrintPatients():
     for value in TCGA_Patients:
         print(value.ID)
 
-
 def RestorePatientDatas():
     global TCGA_Patients
+    global GeneList
 
+    
     TCGA_Patients.clear()
 
     root_win = Tk()
@@ -275,12 +503,13 @@ def RestorePatientDatas():
     for file in filenames:
         with open(file, 'rb') as f:
             tempTCGA, tempGeneList, tempProcessedData = pickle.load(f)
-            TCGA_Patients += tempTCGA
+            StorePatientDatas(tempTCGA)
+            GeneList = GeneList + list(set(GeneList) - set(tempGeneList))
 
 def ImportTCGAData():
     filename = filedialog.askopenfilename()
     
-    df = pd.read_csv(filename)
+    df = pd.read_csv(filename, low_memory=False)
     df.columns = df.iloc[0]
     df = df[1:]
     
@@ -293,7 +522,13 @@ def IsGeneStored(gene_ID):
     
     return False
 
+# "legacy" code implies that this implementation should be on its way out...
+# TODO: finish the new save/restore implementation
 def SaveLegacy():
+    global TCGA_Patients
+    global GeneList
+    global ProcessedDataBuffer
+    
     root_win = tk.Tk() # TODO: fix so only need to create root window once
     root_win.withdraw()
 
@@ -305,10 +540,6 @@ def RestoreLegacy():
     global GeneList
     global ProcessedDataBuffer
     global TCGA_Patients
-    
-    GeneList.clear()
-    TCGA_Patients.clear()
-    ProcessedDataBuffer.clear()
 
     root_win = Tk()
     root_win.withdraw()
@@ -316,8 +547,48 @@ def RestoreLegacy():
     filename = filedialog.askopenfilename()
     
     f = open(filename, 'rb')
-    TCGA_Patients, GeneList, ProcessedDataBuffer = pickle.load(f)
+    tempPT, tempGL, tempPDB = pickle.load(f)
+    print(tempGL)
+    # todo: remove
+    '''if type(tempPT[0]) is list:
+        tempPT = [pt for ptlist in tempPT for pt in ptlist]
+    if type(tempGL[0]) is list:
+        tempGL = [pt for ptlist in tempGL for pt in ptlist]
+    '''
+    if len(TCGA_Patients) != 0:
+        # check if we should combine the data
+        StorePatientDatas(tempPT)
+        GeneList = GeneList + list(set(tempGL) - set(GeneList))
+    else:
+        TCGA_Patients = tempPT
+        GeneList = tempGL
 
+    ProcessedDataBuffer.clear()
+    ProcessedDataBuffer = tempPDB
+    
+    
+def CombineLegacyData():
+    global GeneList
+    global ProcessedDataBuffer
+    global TCGA_Patients
+
+    GeneList.clear()
+    ProcessedDataBuffer.clear()
+    TCGA_Patients.clear()
+
+    filenames = filedialog.askopenfilenames()
+    for file in filenames:
+        tempGL = None
+        tempPDB = None
+        tempTCGA = None
+
+        with open(file, 'rb') as f:
+            tempTCGA, tempGL, tempPDB = pickle.load(f)
+
+        GeneList += tempGL
+        ProcessedDataBuffer += tempPDB
+        TCGA_Patients += tempTCGA
+    
 # TODO: change to work as zip file
 def SavePatientData():
     root_win = tk.Tk() # TODO: fix so only need to create root window once
@@ -585,10 +856,16 @@ class ExpressionData:
 
         if len(self.IValues) == 0 or len(self.DValues) == 0:
             return
-        
-        xlowbound = min(self.IValues)
-        xhighbound = max(self.IValues)
 
+        try: # for some reason empty lvalue and dvalue arrays are making it to this point and then crashing the script...
+            xlowbound = min(self.IValues)
+            xhighbound = max(self.IValues)
+        except:
+            return
+
+        fig.text(0.3, 0.9, "Correlation Coefficient: " + str(self.CorCoeff))
+        fig.text(0.3, 0.87, "P-Value: " + str(self.pval))
+        
         fig.suptitle(str(self.IGene) + " vs. " + str(self.DGene))
         xseq = np.linspace(xlowbound, xhighbound, num=100)
         ax.plot(xseq, self.intercept + self.slope * xseq, color="k", lw=2.5)
@@ -627,6 +904,43 @@ class ExpressionData:
     @staticmethod
     def GetIntercept(graph):
         return graph.intercept
+
+
+def ProcessGenesForGeneList(Igene, Iexpressiontype, Dgenelist, Dexpressionlist):
+    graphlist = []
+    for idx,Dgene in enumerate(Dgenelist):
+        graph = ExpressionData(Igene, Iexpressiontype, Dgene, Dexpressionlist[idx])
+        graph.ProcessData()
+        graphlist.append(graph)
+
+    return graphlist
+
+def ProcessGeneListForClinicalFeature(Igene, Iexpressiontype, Dgenelist, Dexpressionlist, feature):
+    graphlist = []
+    # first iterate through patient data, gather possible clinical feature values
+    featurestates = []
+    for pt in TCGA_Patients:
+        temp = pt.GetClinicalFeature(feature)
+        if temp is None:
+            continue
+
+        if type(temp) is not str:
+            continue #sometimes pandas will be dumb and replace NA with NAN even when I want NA to mean 'not applicable'
+        
+        if temp not in featurestates:
+            featurestates.append(temp)
+    
+    # for each possible value, compute expression data of that group
+    with alive_bar(len(Dgenelist) * len(featurestates)) as bar:
+        for featureval in featurestates:
+            for idx,val in enumerate(Dgenelist):
+                if Igene is val: continue
+                tempgraph = ExpressionData(Igene, Iexpressiontype, val, Dexpressionlist[idx])
+                tempgraph.ProcessDataForClinicalFeature(feature, featureval)
+                graphlist.append(tempgraph)
+                bar()
+
+    return graphlist
 
 def FastGraphGenes(Igene, Iexpressiontype, Dgene, Dexpressiontype):
     graph = ExpressionData(Igene, Iexpressiontype, Dgene, Dexpressiontype)
@@ -780,7 +1094,8 @@ def _QuitDataViewer(root):
     root.quit()
     root.destroy()
 
-# contatiner for data so we can have sort functions that arent global and the like
+# contatiner for data to implement sort functions and visualization
+# Create different modes of data visualization, such as viewing multiple regressions at the same time
 class ExpressionDataContainer:
     def __init__(self):
         self.Data = []
@@ -800,7 +1115,7 @@ class ExpressionDataContainer:
     # saved to a file and the original values arent overwritten
     @staticmethod
     def CreateForClinicalFeature(feature,val):
-        return ExpressionDataContainter(filter(lambda x: x.GetMetadata(feature) == val, ProcessedDataBuffer.copy()))
+        return ExpressionDataContainer(filter(lambda x: x.GetMetadata(feature) == val, ProcessedDataBuffer.copy()))
 
     @staticmethod
     def CreateForGeneList(Igenes, Dgenes):
@@ -831,7 +1146,7 @@ class ExpressionDataContainer:
     @staticmethod
     def _FilterSmallData(data):
         # filter out data with less than 10 values
-        if len(data.IValues) < 10:
+        if len(data.IValues) < 30:
             return False
         return True
 
@@ -859,16 +1174,20 @@ class ExpressionDataContainer:
     def FilterLowCC(self):
         return self.filter(ExpressionDataContainer._FilterLowCC)
 
-    def FilterForGenes(Igenes, Dgenes):
-        return self.filter(lambda x: x.IGene in Igenes or x.DGene in Dgenes)
+    def FilterForGenes(self, genes):
+        return self.filter(lambda x: x.IGene in genes or x.DGene in genes)
     
     def SearchForGene(self, gene):
+        returnVal = []
         for val in self.Data:
             if val.DGene == gene:
-                return val
+                returnVal.append(val)
 
-        return None
+        return ExpressionDataContainer(returnVal)
 
+
+    def FilterForMetadata(self, ID, val):
+        return self.filter(lambda x: x.metadata[ID] == val)
 
     #def GetMeanOfMetric(metricfn):
 
@@ -954,7 +1273,6 @@ class ExpressionDataContainer:
         # display everything
         child_win.mainloop()
         
-        
 
     def VisualizeData(self):
         # click through each data set, which displays a scatterplot with a linear regression, and any other metadata
@@ -1012,6 +1330,8 @@ class ExpressionDataContainer:
         root_win.protocol("WM_DELETE_WINDOW", lambda: _QuitDataViewer(root_win))
         
         tk.mainloop()
+
+        self.tkwindow = None
         
 def ProcessAllGenesForIGene(IGene, Iexpressiontype, Dexpressiontype):
     global ProcessedDataBuffer
@@ -1550,57 +1870,431 @@ def LoadFirebrowseClinicalFeatures():
         for value in temprow.index:
             pt.AppendClinicalFeature(value, temprow[value])
 
-def UlcerationGraph(Igene, stratification_metric=None):
-    # crete matplotib bar graph
-    fig, ax = plt.subplots()
+def GetPossibleFeatureValues(clinical_feature):
+    global TCGA_Patients
+    clinical_feature_values = []
 
+    
+    for pt in TCGA_Patients:
+        feature = pt.GetClinicalFeature(clinical_feature)
+        if feature not in clinical_feature_values:
+            clinical_feature_values.append(feature)
+
+    return clinical_feature_values
+
+def BuildFeatureList(clinical_feature):
+    returnVal = {}
+
+    for pt in TCGA_Patients:
+        feature = pt.GetClinicalFeature(clinical_feature)
+        if not feature:
+            continue
+
+        if feature not in returnVal.keys():
+            returnVal[feature] = [pt.ID]
+        else:
+            returnVal[feature].append(pt.ID)
+
+    return returnVal
+
+def prime_factors(n):
+    returnVal = []
+
+    i : int = 2
+    while i*i <= n:
+        if n % i:
+            i += 1
+            continue
+        else:
+            n //= i
+            returnVal.append(i)
+
+    if n > 1:
+        returnVal.append(n)
+    
+    return returnVal
+    
+# only works well for small values, for values >= 15 it will give a very uneven split!
+def GetClosestSquareBounds(n):
+    factors = prime_factors(n)
+        
+    low = hi = 1
+
+    for x in factors[:int(np.ceil(len(factors)/2))]:
+        low *= x
+
+    for x in factors[int(np.ceil(len(factors)/2)):]:
+        hi *= x
+
+    return (low, hi)
+
+def GetGeneStratID(gene):
+    return f"{gene}_expression"
+
+def GenerateClinicalFeatureForGeneStratification(gene, expressiontype, low, hi):
+    global TCGA_Patients
+
+    expression = np.array([float(val.GetExpressionValue(gene, expressiontype)) for val in TCGA_Patients if val is not None and val.GetExpressionValue(gene, expressiontype) is not None])
+
+    val_high = np.percentile(expression, hi)
+    val_low = np.percentile(expression, low)
+    
+    for pt in TCGA_Patients:
+        exp = pt.GetExpressionValue(gene, expressiontype)
+        if exp is not None:
+            if float(exp) > val_high:
+                pt.AppendClinicalFeature(GetGeneStratID(gene), "hi")
+            elif float(exp) < val_low:
+                pt.AppendClinicalFeature(GetGeneStratID(gene), "lo")
+
+
+def RemoveGeneStratificationFeature(gene):
+    for pt in TCGA_Patients:
+        pt.RemoveClinicalFeature(GetGeneStratID(gene))
+
+def PlotExpressionByFeature(Igene, expressiontype, nullgroup, stratification_metric, plot : bool = True):
+    cvalues = [x for x in GetPossibleFeatureValues(stratification_metric) if x]
+    #pdb.set_trace()
+    cvalmap = {x : idx for idx,x in enumerate(cvalues)}
+    values = [[] for x in cvalues]
+        
+    for pt in TCGA_Patients:
+        featureval = pt.GetClinicalFeature(stratification_metric)
+
+        if featureval is None:
+            continue
+        if pt.CheckGeneDict(Igene, expressiontype):
+            exp = float(pt.GetExpressionValue(Igene, expressiontype))
+            if exp != 0.0:
+                values[ cvalmap[ pt.GetClinicalFeature(stratification_metric) ] ].append( float(pt.GetExpressionValue(Igene, expressiontype)) )
+       
+    # check which groups have zero values and remove them ( don't combine, leave it like this for the sake of debugging and readability)
+    usemetrics = [i for i in range(0,len(cvalmap)) if len(values[i]) > 0]
+
+    if not usemetrics:
+        print("No patients with clinical feature found!")
+        return None
+    
+    if cvalmap[nullgroup] not in usemetrics:
+        print("The null group is empty!")
+        return None
+    
+    #avg = [ sum(values[idx]) / len(values[idx]) for idx in usemetrics ] # averages
+    #nzf_rdpm = deepcopy(avg)
+    # normalize each average (0 ulcerated, 1 non ulcerated)
+    # iterate through usemetrics to only get groups that we KNOW have values
+    for idx,pos in enumerate(usemetrics):
+        for idx,val in enumerate(values[pos]):
+            values[pos][idx] = np.log2(val)
+
+    avg = [ sum(values[idx]) / len(values[idx]) for idx in usemetrics ] # averages
+    
+    
+    err = [scipy.stats.sem(values[x]) for x in usemetrics]
+
+    # go ahead and just return the significance if we are not plotting
+    if plot is False:
+        ttestafter = {}
+        enriched = {}
+        for idx,val in enumerate(usemetrics):
+            if values[cvalmap[nullgroup]] == val:
+                continue
+            
+            ttestafter[cvalues[val]] = scipy.stats.ttest_ind(values[cvalmap[nullgroup]], values[val])
+            enriched[cvalues[val]] = avg[cvalmap[nullgroup]] > avg[idx]
+        return (ttestafter, enriched)
+
+    axesarea = len(usemetrics)
+    bounds = GetClosestSquareBounds(axesarea)
+    while 1 in bounds:
+        axesarea += 1
+        bounds = GetClosestSquareBounds(axesarea)
+        
+    #fig,ax = plt.subplots(ncols = bounds[0], nrows = bounds[1])
+    fig,ax = plt.subplots()
+    #plt.title(f'{Igene} expression in ulcerated vs non ulcerated melanoma seggregated by {stratification_metric}')
+    plt.xlabel(stratification_metric)
+    plt.ylabel('normalized RPKM')
+    plt.title(f'{gene} expression stratified by {feature}')
+    # iterate through each graph
+    '''for idx,pos in enumerate(usemetrics): # only use the indicies that we know have values
+        ax[idx // bounds[0], idx % bounds[0]].violinplot([values[pos], values[pos]])
+        ax[idx // bounds[0], idx % bounds[0]].set_xticks([1,2], labels=cvalues)
+            
+        #for i in range(0,len(ulceration_stats)):
+        #    ax[idx // bounds[0], idx % bounds[0]].scatter(i + np.random.random(len(values[i][pos])) * .8 - .8 / 2, values[i][pos], color=colors[i], label=ulceration_stats[i])
+
+
+        ax[idx // bounds[0], idx % bounds[0]].set_title(f'{cvalues[pos]}')
+        ax[idx // bounds[0], idx % bounds[0]].set_xlabel(stratification_factor)
+        ax[idx // bounds[0], idx % bounds[0]].set_ylabel(f'log2 {Igene} Expression')'''
+
+    ax.violinplot([val for val in values if val])
+    ax.set_xticks(range(1,len(cvalues)+1), labels=cvalues)
+    
+    ttestafter = {}
+    enriched = {}
+
+    for idx,val in enumerate(usemetrics):
+        if values[cvalmap[nullgroup]] == val:
+            continue
+        
+        ttestafter[cvalues[val]] = scipy.stats.ttest_ind(values[cvalmap[nullgroup]], values[val])
+        enriched[cvalues[val]] = avg[cvalmap[nullgroup]] < avg[idx]
+
+    print(ttestafter)
+        
+    plt.subplots_adjust(hspace=1.5)
+    plt.show()
+
+    return (ttestafter, enriched)
+
+def UlcerationGraph(Igene, expressiontype, stratification_metric=None, plot : bool = True):
+    
+    #pdb.set_trace()
+    
     ulceration_stats = ['Ulcerated', 'Non-ulcerated']
+    '''stranslate = {'Local Disease (i & ii)' : ['stage 0','stage i','stage ia','stage ib','stage ic', 'i/ii nos', 'stage ii', 'stage iia', 'stage iib', 'stage iic'],
+                  'Late Stage and Mestastatic (iii & iv)' : ['stage iii', 'stage iiia', 'stage iiib', 'stage iiic', 'stage iv'],
+                  'Only Metastatic (iv)' : ['stage iv'],
+                  'All Stages' : stages}'''
 
     colors = [(0, 0, 1, 1), (1, 0, 0, 1)]
     if stratification_metric is None:
         values = [ [],[] ]
         for pt in TCGA_Patients:
             if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes':
-                if pt.CheckGeneDict(Igene, 'reads_per_million_miRNA_mapped'):
-                    values[0].append( float(pt.GetExpressionValue(Igene, 'reads_per_million_miRNA_mapped')) )
+                if pt.CheckGeneDict(Igene, expressiontype):
+                    exp = float(pt.GetExpressionValue(Igene, expressiontype))
+                     
+                    if exp != 0.0:
+                        values[0].append( float(pt.GetExpressionValue(Igene, expressiontype)) )
             elif pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'no':
-                if pt.CheckGeneDict(Igene, 'reads_per_million_miRNA_mapped'):
-                    values[1].append( float(pt.GetExpressionValue(Igene, 'reads_per_million_miRNA_mapped')) )
-        
-        err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
+                if pt.CheckGeneDict(Igene, expressiontype):
+                    exp = float(pt.GetExpressionValue(Igene, expressiontype))
+                     
+                    if exp != 0.0:
+                        values[1].append( float(pt.GetExpressionValue(Igene, expressiontype)) )
+
+        #err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
 
         counts = [sum(values[0]) / len(values[0]), sum(values[1]) / len(values[1])]
-        
+        #print(counts)
         # normalize to fold change
         nzf_rdpm = counts[1]
 
-        counts[0] = np.log2(counts[1] / nzf_rdpm)
-        counts[1] = np.log2(1.0)
-
-        ttestbefore = scipy.stats.ttest_ind(values[0], values[1])
+        #ttestbefore = scipy.stats.ttest_ind(values[0], values[1])
         
         for index,val in enumerate(values[0]):
-            values[0][index] = np.log2(val/nzf_rdpm)
+            values[0][index] = float(np.log2(val))#np.log2(val/nzf_rdpm)
 
         for index,val in enumerate(values[1]):
-            values[1][index] = np.log2(val/nzf_rdpm)
+            values[1][index] = float(np.log2(val))#np.log2(val/nzf_rdpm)
 
+
+        if plot is False:
+            ttestafter = scipy.stats.ttest_ind(values[0], values[1])
+            return (ttestafter, counts[0] > counts[1])
+        
+
+        fig,ax = plt.subplots()
+        
+        # recompute mean
+        counts = [sum(values[0]) / len(values[0]), sum(values[1]) / len(values[1])]
+        
         # calculate standard error of mean
         err = [scipy.stats.sem(values[0]), scipy.stats.sem(values[1])]
+        ax.violinplot(values)
         
-        ax.bar(ulceration_stats, counts, width=0.8)
-        plt.errorbar(ulceration_stats, [counts[0], counts[1]], yerr=err, fmt="o", color="g")
-        ax.set_ylabel('reads_per_million_miRNA_mapped')
-        ax.set_title('196b expression in ulcerated vs non ulcerated Melanoma')
+        #plt.errorbar(ulceration_stats, [counts[0], counts[1]], yerr=err, fmt="o", color="g")
+        ax.set_xticks([1,2], labels=ulceration_stats)
+        ax.set_ylabel(f'log2 of {expressiontype}')
+        ax.set_title(f'log2 {Igene} expression in ulcerated vs non ulcerated Melanoma')
 
-        for i in range(len(ulceration_stats)):
-             ax.scatter(i + np.random.random(len(values[i])) * .8 - .8 / 2, values[i], color=colors[i])
+        #for i in range(len(ulceration_stats)):
+             #ax.scatter(i + np.random.random(len(values[i])) * .8 - .8 / 2, values[i], color=colors[i])
 
         ttestafter = scipy.stats.ttest_ind(values[0], values[1])
+        print(ttestafter)
+        plt.show()
+        
+        return (ttestafter, counts[0] > counts[1])
     else:
-        print('')
+        cvalues = GetPossibleFeatureValues(stratification_metric)
+        #pdb.set_trace()
+        cvalmap = {x : idx for idx,x in enumerate(cvalues)}
+        values = [[[] for x in cvalues], [[] for x in cvalues]]
+        
+        for pt in TCGA_Patients:
+            if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes': #TODO: This should be .GetClinicalFeature
+                if pt.CheckGeneDict(Igene, expressiontype):
+                    if pt.GetClinicalFeature(stratification_metric) is None:
+                        continue
+                    
+                    exp = float(pt.GetExpressionValue(Igene, expressiontype))
+                    if exp != 0.0:
+                        values[0][ cvalmap[ pt.GetClinicalFeature(stratification_metric) ] ].append( float(pt.GetExpressionValue(Igene, expressiontype)) )
+            elif pt.GetClinicalFeature('melanoma_ulceration_indicator') == 'no':
+                if pt.CheckGeneDict(Igene, expressiontype):
+                    if pt.GetClinicalFeature(stratification_metric) is None:
+                        continue
+                    
+                    exp = float(pt.GetExpressionValue(Igene, expressiontype))
+                    if exp != 0.0:
+                        values[1][ cvalmap[ pt.GetClinicalFeature(stratification_metric) ] ].append( float(pt.GetExpressionValue(Igene, expressiontype)) )
+                    
+        # check which groups have zero values and remove them ( don't combine, leave it like this for the sake of debugging and readability)
+        usemetrics = [i for i in range(0,len(cvalmap)) if len(values[0][i]) > 0 and len(values[1][i]) > 0]
+        
+        avg = [ [ sum(values[0][idx]) / len(values[0][idx]) for idx in usemetrics ], [ sum(values[1][idx]) / len(values[1][idx]) for idx in usemetrics ] ] # averages
+        nzf_rdpm = deepcopy(avg[1]) # non-uncerated groups
+        # normalize each average (0 ulcerated, 1 non ulcerated)
+        # iterate through usemetrics to only get groups that we KNOW have values
+        for idx0,pos0 in enumerate(usemetrics):
+            #avg[0][idx0] = avg[0][idx0] / nzf_rdpm[idx0]
+            for idx,val in enumerate(values[0][pos0]):
+                values[0][pos0][idx] = np.log2(val)# / nzf_rdpm[idx0])
+
+        for idx1,pos1 in enumerate(usemetrics):
+            #avg[1][idx1] = 1.0
+            for idx,val in enumerate(values[1][pos1]):
+                values[1][pos1][idx] = np.log2(val )#/ nzf_rdpm[idx1])
+
+        # recompute averages
+        avg = [ [ sum(values[0][idx]) / len(values[0][idx]) for idx in usemetrics ], [ sum(values[1][idx]) / len(values[1][idx]) for idx in usemetrics ] ]
     
-    plt.show()
+        
+        err = [[scipy.stats.sem(values[0][x]) for x in usemetrics], [scipy.stats.sem(values[1][x]) for x in usemetrics]]
+
+        # go ahead and just return the significance if we are not plotting
+        if plot is False:
+            ttestafter = {}
+            enriched = {}
+            for idx,val in enumerate(usemetrics):
+                ttestafter[cvalues[val]] = scipy.stats.ttest_ind(values[0][val], values[1][val])
+                enriched[cvalues[val]] = avg[0][idx] > avg[1][idx]
+            return (ttestafter, enriched)
+
+        axesarea = len(usemetrics)
+        bounds = GetClosestSquareBounds(axesarea)
+        while 1 in bounds:
+            axesarea += 1
+            bounds = GetClosestSquareBounds(axesarea)
+        
+        fig,ax = plt.subplots(ncols = bounds[0], nrows = bounds[1])
+        #plt.title(f'{Igene} expression in ulcerated vs non ulcerated melanoma seggregated by {stratification_metric}')
+        plt.xlabel('Ulceration Status')
+        plt.ylabel('normalized RPKM')
+        # iterate through each graph
+        for idx,pos in enumerate(usemetrics): # only use the indicies that we know have values
+            ax[idx // bounds[0], idx % bounds[0]].violinplot([values[0][pos], values[1][pos]])
+            ax[idx // bounds[0], idx % bounds[0]].set_xticks([1,2], labels=ulceration_stats)
+            
+            #for i in range(0,len(ulceration_stats)):
+            #    ax[idx // bounds[0], idx % bounds[0]].scatter(i + np.random.random(len(values[i][pos])) * .8 - .8 / 2, values[i][pos], color=colors[i], label=ulceration_stats[i])
+
+
+            ax[idx // bounds[0], idx % bounds[0]].set_title(f'{cvalues[pos]}')
+            ax[idx // bounds[0], idx % bounds[0]].set_xlabel(f'{stratification_metric}: {cvalues[pos]}')
+            ax[idx // bounds[0], idx % bounds[0]].set_ylabel(f'log2 {Igene} Expression')
+
+        ttestafter = {}
+        enriched = {}
+
+        for idx,val in enumerate(usemetrics):
+            ttestafter[cvalues[val]] = scipy.stats.ttest_ind(values[0][val], values[1][val])
+            enriched[cvalues[val]] = avg[0][idx] > avg[1][idx]
+
+        print(ttestafter)
+        
+        plt.subplots_adjust(hspace=1.5)
+        plt.show()
+
+        return (ttestafter, enriched)
+
+def GuessExpressionType(gene):
+    if '|' in gene:
+        return 'normalized_count'
+    else:
+        return 'reads_per_million_miRNA_mapped'
+
+# either hi or low, filtering genes that have higher or lower expression in ulcerated groups respectively
+def FindSignificantUlcerationGenes(pval, df):
+    global GeneList
+
+    returnVal = []
+
+    with alive_bar(len(GeneList)) as bar:
+        for gene in GeneList:
+            try:
+                ttest, enriched = UlcerationGraph(gene, GuessExpressionType(gene), plot = False)
+                #print(ttest)
+                if df == 'hi':
+                    if ttest.pvalue < pval and enriched:
+                        returnVal.append((gene, ttest.pvalue))
+                    bar()
+                elif df == 'low':
+                    if ttest.pvalue < pval and not enriched:
+                        returnVal.append((gene, ttest.pvalue))
+                    bar()
+                elif df == 'both':
+                    if ttest.pvalue < pval:
+                        returnVal.append((gene, ttest.pvalue))
+                    bar()
+                else:
+                    print(f'Invalid vaulue {df} passed to df, must be either hi, low or both!')
+            except:
+                bar()
+    return returnVal
+
+# find genes with differential expression between ulcerated and non ulcerated when miR expression is high
+def FindDiffUlcerationGenes(pval, stratgene, lo, hi):
+    global GeneList
+
+    returnVal = []
+    
+    GenerateClinicalFeatureForGeneStratification(stratgene, GuessExpressionType(stratgene), lo, hi)
+    
+    with alive_bar(len(GeneList)) as bar:
+        for gene in GeneList:
+            try:
+                ttest, enriched = UlcerationGraph(gene, GuessExpressionType(gene), stratification_metric=GetGeneStratID(stratgene),plot = False)
+                if ttest['hi'].pvalue < pval and not enriched['hi']:
+                    returnVal.append((gene, pval))
+                bar()
+            except:
+                bar()
+    #RemoveGeneStratificationFeature(stratgene)
+    return returnVal
+
+def FindDiffByMutation(pval, feature, nullgrp, df):
+    global GeneList
+
+    returnVal = []
+
+    with alive_bar(len(GeneList)) as bar:
+        for gene in GeneList:
+            try:
+                ttest, enriched = PlotExpressionByFeature(gene, GuessExpressionType(gene), nullgrp, feature, plot = False)
+                #print(ttest)
+                if df == 'hi':
+                    if ttest['yes'].pvalue < pval and enriched['yes']:
+                        returnVal.append((gene, ttest['yes'].pvalue))
+                    bar()
+                elif df == 'low':
+                    if ttest['yes'].pvalue < pval and not enriched['yes']:
+                        returnVal.append((gene, ttest['yes'].pvalue))
+                    bar()
+                elif df == 'both':
+                    if ttest['yes'].pvalue < pval:
+                        returnVal.append((gene, ttest['yes'].pvalue))
+                    bar()
+                else:
+                    print(f'Invalid vaulue {df} passed to df, must be either \'hi\', \'low\' or \'both\'!')
+            except:
+                bar()
+    return returnVal
+    
 # batch normalization
 def CreateUlcerationWorkbook(mirs, readtypes):
     savename = filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=(("excel file", "*.xlsx"),("All Files", "*.*") ))
@@ -1654,8 +2348,28 @@ def CreateUlcerationWorkbook(mirs, readtypes):
 
     wb.save(savename)
 
+def GeneHistogram(gene, expressiontype):
+    # collect all gene expression values
+    values = []
+
+    for pt in TCGA_Patients:
+        if pt.CheckGeneDict(gene, expressiontype):
+            exp = float(pt.GetExpressionValue(gene, expressiontype))
+            
+            if exp != 0.0:
+                values.append( np.log2(float(pt.GetExpressionValue(gene, expressiontype))) )
+
+    plt.hist(values)
+
+    plt.xlabel(f'{gene} expression level')
+    plt.ylabel(f'number of samples')
+    plt.title(f'{gene} distribution')
+
+    plt.show()
+    
 # visualize slope data against prediction algorithms too!
-def GenerateUlcerationHeatmap(expressioncontainer):
+# grpreturn is eithe 'ulcerated' or 'non-ulcerated' and returns the significant genes which are downregulated
+def GenerateUlcerationHeatmap(expressioncontainer, grpreturn, dx):
     # set up dataframe such that column headers are "ulcerated", "non-ulcerated", "N/A"
     # and row headers are gene names
     global GeneList
@@ -1663,25 +2377,32 @@ def GenerateUlcerationHeatmap(expressioncontainer):
 
     clinicalfeaturemap = {'no' : 'non-ulcerated', 'yes' : 'ulcerated'}
     
-    ulcerationdata = {'ulcerated' : [0.] * len(GeneList), 'non-ulcerated' : [0.] * len(GeneList)}
+    ulcerationdata = {'ulcerated' : [np.nan] * len(GeneList), 'non-ulcerated' : [np.nan] * len(GeneList)}
     df = pd.DataFrame(ulcerationdata, index=GeneList.copy())
 
-    # for each entry in the processed data
-        # seggregate the slope values into the dataframe
-    for val in ProcessedDataBuffer:
-        if len(val.IValues) < 10 or val.DGene not in df.index:
-            continue
+    # for gene that we know of
+    # seggregate the slope values into the dataframe
+    for val in GeneList:
+        datas = expressioncontainer.SearchForGene(val)
+        df.loc[val] = [np.nan, np.nan]# set gene values to NAN
+        for data in datas.Data:
+            #if data.pval > 0.05:
+            #   continue
 
-        cf = val.GetMetadata('melanoma_ulceration_indicator')
+            if len(data.IValues) < 30:
+                continue
 
-        if cf not in clinicalfeaturemap.keys():
-            continue
+            ui = data.GetMetadata('melanoma_ulceration_indicator')
 
-        if val.pval > 0.1 or len(val.IValues) < 30:
-            continue
+            if ui not in clinicalfeaturemap.keys():
+                continue
+
+            if clinicalfeaturemap[ui] == grpreturn:
+                if data.pval > 0.05:
+                    continue
         
-        df.at[val.DGene, clinicalfeaturemap[cf]] = val.slope
-
+            df.at[val, clinicalfeaturemap[ui]] = data.CorCoeff
+            
     # scale to unit variance (SD)
     #scaled_data = StandardScaler().fit_transform(df.transpose())
     #df = pd.DataFrame(scaled_data.transpose(), index = df.index, columns = df.columns)
@@ -1696,18 +2417,186 @@ def GenerateUlcerationHeatmap(expressioncontainer):
             df.drop(index)
         if np.isnan(row['ulcerated']):
             df = df.drop(index)'''
-        if abs(row['ulcerated'] - row['non-ulcerated']) < 0.4:
+        if row.isnull().any():
             df = df.drop(index)
-
-    print(df.index.tolist())
+            continue
+        
+        if abs(row['ulcerated'] - row['non-ulcerated']) < 0.2:
+            df = df.drop(index)
+    
+    #pdb.set_trace()
     # visualize with heatmap
     # (only ulcerated because we know non ulcerated is 1)
-    seaborn.clustermap(df, z_score=None, standard_scale=None, yticklabels=True)
+    sns.clustermap(df, z_score=None, standard_scale=None, yticklabels=False)
+    plt.title('correlation in ulcerated vs. non-ulcerated groups')
     plt.show()
 
+    if dx == 'pos':
+        return df[ df[grpreturn] > 0 ].index.tolist()
+    elif dx == 'neg':
+        return df[ df[grpreturn] < 0 ].index.tolist()
+    else:
+        print(f'Invalid value {df} passed to df, should either be pos or neg')
+#def GenerateCCFiles(data, stratmetric=None):
+#    if stratmetric=None:
+        
 
 tm_strings = {'DSS': ['DSS_cr', 'DSS.time.cr'], 'PFI': ['PFI.cr', 'PFI.time.cr']}
-def SurvivalCurve196(percentile_low, percentile_high, timemetric):
+
+'''def SurvivalCurveByFeature(feature, timemetric):
+    global TCGA_Patients
+    stages = ['stage 0', 'stage i', 'stage ia', 'stage ib', 'stage ic', 'i/ii nos', 'stage ii', 'stage iia', 'stage iib', 'stage iic', 'stage iii', 'stage iiia', 'stage iiib', 'stage iiic', 'stage iv']
+    
+    # load survival data
+    survival_df = pd.read_csv(filedialog.askopenfilename(defaultextension='.csv', filetypes=(("comma seperated values file", "*.csv"),("All Files", "*.*") )))
+    
+    # build matrix from survival data
+    # get SKCM
+    skcm_df = survival_df[ survival_df['type'] == 'SKCM']
+    
+    # get feature data
+    feature = [val.GetClinicalFeature(feature) for val in TCGA_Patients if val is not None and val.GetClinicalFeature(feature) is not None]
+    
+    stranslate = {'Local Disease (i & ii)' : ['stage 0','stage i','stage ia','stage ib','stage ic', 'i/ii nos', 'stage ii', 'stage iia', 'stage iib', 'stage iic'],
+                  'Late Stage and Mestastatic (iii & iv)' : ['stage iii', 'stage iiia', 'stage iiib', 'stage iiic', 'stage iv'],
+                  'Only Metastatic (iv)' : ['stage iv'],
+                  'All Stages' : stages}
+
+    pt_status =  {x : [] for x in stranslate.keys()}
+    pfi_time =   {x : [] for x in stranslate.keys()}
+
+    for val in skcm_df['bcr_patient_barcode']:
+        pt = GetPatient(val)
+
+        if pt is None:
+            continue
+
+        stage = pt.GetClinicalFeature('pathologic_stage')
+        
+        if stage not in stages:
+            continue
+        
+        for key, value in stranslate.items():
+            if stage in value:
+                masked = skcm_df[skcm_df['bcr_patient_barcode'] == val]
+                tempstatus = masked[tm_strings[timemetric][0]].array[0]
+                temptime = masked[tm_strings[timemetric][1]].array[0]
+
+                if tempstatus == '#N/A':
+                    continue
+                elif temptime == '#N/A' or temptime == 0:
+                    continue
+
+                tempexp = pt.GetExpressionValue(gene, expressiontype)
+                if tempexp is None:
+                    continue
+                
+                if float(tempexp) > val_high:
+                    percentile[key].append('hi')
+                elif float(tempexp) < val_low:
+                    percentile[key].append('lo')
+                else:
+                    continue
+
+                if tempstatus == 1:
+                    pt_status[key].append(1)
+                else:
+                    pt_status[key].append(0)
+
+                pfi_time[key].append(float(temptime))
+                if np.isnan(temptime): # for some reason a NaN slips through when all of the entries are N/A, temporary workaround
+                    percentile[key].pop()
+                    pt_status[key].pop()
+                    pfi_time[key].pop()
+
+    skcm_dfs = []
+    
+    for key in stranslate.keys():
+        skcm_dfs.append(pd.DataFrame({gene : percentile[key],
+                            'Status' : pt_status[key],
+                            'Time': pfi_time[key]}))
+    
+    
+    maskhi = skcm_df[gene] == 'hi'
+    masklo = skcm_df[gene] == 'lo'
+    
+    # load into learner of choice
+    time_cell, survival_prob_cell, conf_int = kaplan_meier_curve(
+        skcm_df['Status'][maskhi], skcm_df['Time'][maskhi])
+    
+    plt.step(time_cell, survival_prob_cell, where="post", label=f"hi (n = {maskhi.sum()})")
+    
+    time_cell, survival_prob_cell, conf_int = kaplan_meier_curve(
+        skcm_df['Status'][masklo], skcm_df['Time'][masklo])
+    
+    plt.step(time_cell, survival_prob_cell, where="post", label=f"hi (n = {maskhi.sum()})")
+
+
+    plt.ylim(0, 1)
+    plt.ylabel("est. probability of survival")
+    plt.xlabel("time")
+    plt.legend(loc="best")
+    #fig,axes = plt.subplots(ncols=3,nrows=5)
+    colval= GetClosestSquareBounds(len(skcm_dfs))[0]
+    rowval = GetClosestSquareBounds(len(skcm_dfs))[1]
+    fig,axes = plt.subplots(ncols=colval,nrows=rowval)
+    kmf = [KaplanMeierFitter()] * len(skcm_dfs)
+    print("=" * 30)
+    print(f"SURVIVAL CURVE {percentile_low}-{percentile_high} for {gene}")
+    print('='*30)
+    if type(axes) is not np.ndarray:
+        axes = [axes] # a bit hacky for my taste but should work
+    
+    for idx,df in enumerate(skcm_dfs):
+        hi_df = df[df[gene] == 'hi']
+        lo_df = df[df[gene] == 'lo']
+        
+        if hi_df.empty or lo_df.empty:
+            continue
+
+    
+        if colval == 1 or rowval == 1:
+            kmf[idx].fit(durations=hi_df['Time'], event_observed=hi_df['Status'], label=f'hi n={len(hi_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx])
+            kmf[idx].fit(durations=lo_df['Time'], event_observed=lo_df['Status'], label=f'lo n={len(lo_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx])
+
+            results = logrank_test(durations_A=hi_df['Time'], durations_B=lo_df['Time'], event_observed_A=hi_df['Status'], event_observed_B=lo_df['Status'])
+            print(f"\nlog rank of group: {list(stranslate.keys())[idx]}")
+            results.print_summary()
+            print('=' * 30)
+            
+            axes[idx].set_title(f'Kaplan-Meier Estimates by Group, {list(stranslate.keys())[idx]}')
+            axes[idx].set_xlabel('Time')
+            axes[idx].set_ylabel('Survival Probability')
+            axes[idx].legend()
+        else:
+            kmf[idx].fit(durations=hi_df['Time'], event_observed=hi_df['Status'], label=f'hi n={len(hi_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx // colval, idx % colval])
+            kmf[idx].fit(durations=lo_df['Time'], event_observed=lo_df['Status'], label=f'lo n={len(lo_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx // colval, idx % colval])
+
+            results = logrank_test(durations_A=hi_df['Time'], durations_B=lo_df['Time'], event_observed_A=hi_df['Status'], event_observed_B=lo_df['Status'])
+            print(f"\nlog rank of group: {list(stranslate.keys())[idx]}")
+            results.print_summary()
+            print('=' * 30)
+            
+            axes[idx // colval, idx % colval].set_title(f'Kaplan-Meier Estimates by Group, {list(stranslate.keys())[idx]}')
+            axes[idx // colval, idx % colval].set_xlabel('Time')
+            axes[idx // colval, idx % colval].set_ylabel('Survival Probability')
+            axes[idx // colval, idx % colval].legend()
+
+    plt.subplots_adjust(hspace=1.5)
+    
+    fig.show()'''
+
+    
+# todo: how to group
+# TODO: Fix pickling TCGA_Patients array
+# TODO: Histogram!!!
+
+# ptlist is so we can stratify
+def SurvivalCurve(percentile_low, percentile_high, timemetric, gene, expressiontype, ptlist=None):
     global TCGA_Patients
     stagefeaturename = 'pathologic_stage'
     stages = ['stage 0', 'stage i', 'stage ia', 'stage ib', 'stage ic', 'i/ii nos', 'stage ii', 'stage iia', 'stage iib', 'stage iic', 'stage iii', 'stage iiia', 'stage iiib', 'stage iiic', 'stage iv']
@@ -1718,72 +2607,90 @@ def SurvivalCurve196(percentile_low, percentile_high, timemetric):
     # build matrix from survival data
     # get SKCM
     skcm_df = survival_df[ survival_df['type'] == 'SKCM']
-
+    
     # get mir-196b expression for percentile seggregation
-    expression_196 = [float(val.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')) for val in TCGA_Patients if val is not None and val.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped') is not None]
+    expression = [float(val.GetExpressionValue(gene, expressiontype)) for val in TCGA_Patients if val is not None and val.GetExpressionValue(gene, expressiontype) is not None]
+    
+    stranslate = {'Local Disease (i & ii)' : ['stage 0','stage i','stage ia','stage ib','stage ic', 'i/ii nos', 'stage ii', 'stage iia', 'stage iib', 'stage iic'],
+                  'Late Stage and Mestastatic (iii & iv)' : ['stage iii', 'stage iiia', 'stage iiib', 'stage iiic', 'stage iv'],
+                  'Only Metastatic (iv)' : ['stage iv'],
+                  'All Stages' : stages}
+    
+    #stranslate = {'all stages' : stages}
 
+    #stranslate = {'stage iii' : ['stage iii', 'stage iiia', 'stage iiib', 'stage iiic']}
+
+    #stranslate = {'stage iii' : ['stage iii']}
+    
+    # REMEMBER TO UPDATE THIS WHEN CHANGING ALGORITHM
+    num_graphs = len(stranslate)
+    
     # load into data matrix
-    percentile_196 = {x : [] for x in stages}
-    pt_status = {x : [] for x in stages}
-    pfi_time = {x : [] for x in stages}
+    percentile = {x : [] for x in stranslate.keys()}
+    pt_status =  {x : [] for x in stranslate.keys()}
+    pfi_time =   {x : [] for x in stranslate.keys()}
 
-    val_high = np.percentile(expression_196, percentile_high)
-    val_low = np.percentile(expression_196, percentile_low)    
-
-    len(percentile_196)
+    val_high = np.percentile(expression, percentile_high)
+    val_low = np.percentile(expression, percentile_low)    
     
     for val in skcm_df['bcr_patient_barcode']:
+        if ptlist is not None:
+            if val not in ptlist:
+                continue
+        
         pt = GetPatient(val)
 
         if pt is None:
             continue
 
         stage = pt.GetClinicalFeature('pathologic_stage')
-
+        
         if stage not in stages:
             continue
         
-        masked = skcm_df[skcm_df['bcr_patient_barcode'] == val]
-        tempstatus = masked[tm_strings[timemetric][0]].array[0]
-        temptime = masked[tm_strings[timemetric][1]].array[0]
+        for key, value in stranslate.items():
+            if stage in value:
+                masked = skcm_df[skcm_df['bcr_patient_barcode'] == val]
+                tempstatus = masked[tm_strings[timemetric][0]].array[0]
+                temptime = masked[tm_strings[timemetric][1]].array[0]
 
-        if tempstatus == '#N/A':
-            continue
-        elif temptime == '#N/A' or temptime == 0:
-            continue
+                if tempstatus == '#N/A':
+                    continue
+                elif temptime == '#N/A' or temptime == 0:
+                    continue
 
-        tempexp = pt.GetExpressionValue('hsa-mir-196b', 'reads_per_million_miRNA_mapped')
-        if tempexp is None:
-            continue
-        
-        if float(tempexp) > val_high:
-            percentile_196[stage].append('hi')
-        elif float(tempexp) < val_low:
-            percentile_196[stage].append('lo')
-        else:
-            continue
+                tempexp = pt.GetExpressionValue(gene, expressiontype)
+                if tempexp is None:
+                    continue
+                
+                if float(tempexp) > val_high:
+                    percentile[key].append('hi')
+                elif float(tempexp) < val_low:
+                    percentile[key].append('lo')
+                else:
+                    continue
 
-        if tempstatus == 1:
-            pt_status[stage].append(1)
-        else:
-            pt_status[stage].append(0)
+                if tempstatus == 1:
+                    pt_status[key].append(1)
+                else:
+                    pt_status[key].append(0)
 
-        pfi_time[stage].append(float(temptime))
-        if np.isnan(temptime): # for some reason a NaN slips through when all of the entries are N/A, temporary workaround
-            percentile_196[stage].pop()
-            pt_status[stage].pop()
-            pfi_time[stage].pop()
+                pfi_time[key].append(float(temptime))
+                if np.isnan(temptime): # for some reason a NaN slips through when all of the entries are N/A, temporary workaround
+                    percentile[key].pop()
+                    pt_status[key].pop()
+                    pfi_time[key].pop()
 
     skcm_dfs = []
     
-    for stage in stages:
-        skcm_dfs.append(pd.DataFrame({'mir-196' : percentile_196[stage],
-                            'Status' : pt_status[stage],
-                            'Time': pfi_time[stage]}))
+    for key in stranslate.keys():
+        skcm_dfs.append(pd.DataFrame({gene : percentile[key],
+                            'Status' : pt_status[key],
+                            'Time': pfi_time[key]}))
     
     
-    '''maskhi = skcm_df['mir-196'] == 'hi'
-    masklo = skcm_df['mir-196'] == 'lo'
+    '''maskhi = skcm_df[gene] == 'hi'
+    masklo = skcm_df[gene] == 'lo'
     
     # load into learner of choice
     time_cell, survival_prob_cell, conf_int = kaplan_meier_curve(
@@ -1801,50 +2708,77 @@ def SurvivalCurve196(percentile_low, percentile_high, timemetric):
     plt.ylabel("est. probability of survival")
     plt.xlabel("time")
     plt.legend(loc="best")'''
-    fig,axes = plt.subplots(ncols=3,nrows=5)
+    #fig,axes = plt.subplots(ncols=3,nrows=5)
+    colval= GetClosestSquareBounds(len(skcm_dfs))[0]
+    rowval = GetClosestSquareBounds(len(skcm_dfs))[1]
+    fig,axes = plt.subplots(ncols=colval,nrows=rowval)
     kmf = [KaplanMeierFitter()] * len(skcm_dfs)
     print("=" * 30)
-    print(f"SURVIVAL CURVE {percentile_low}-{percentile_high}")
+    print(f"SURVIVAL CURVE {percentile_low}-{percentile_high} for {gene}")
     print('='*30)
+    if type(axes) is not np.ndarray:
+        axes = [axes] # a bit hacky for my taste but should work
+    
     for idx,df in enumerate(skcm_dfs):
-        hi_df = df[df['mir-196'] == 'hi']
-        lo_df = df[df['mir-196'] == 'lo']
+        hi_df = df[df[gene] == 'hi']
+        lo_df = df[df[gene] == 'lo']
         
         if hi_df.empty or lo_df.empty:
             continue
-        
-        kmf[idx].fit(durations=hi_df['Time'], event_observed=hi_df['Status'], label=f'hi n={len(hi_df.index)}')
-        kmf[idx].plot_survival_function(ax=axes[idx // 3, idx % 3])
-        kmf[idx].fit(durations=lo_df['Time'], event_observed=lo_df['Status'], label=f'lo n={len(lo_df.index)}')
-        kmf[idx].plot_survival_function(ax=axes[idx // 3, idx % 3])
 
-        results = logrank_test(durations_A=hi_df['Time'], durations_B=lo_df['Time'], event_observed_A=hi_df['Status'], event_observed_B=lo_df['Status'])
-        print(f"\nlog rank of group: {stages[idx]}")
-        results.print_summary()
-        print('=' * 30)
-        
-        axes[idx // 3, idx % 3].set_title(f'Kaplan-Meier Estimates by Group, {stages[idx]}')
-        axes[idx // 3, idx % 3].set_xlabel('Time')
-        axes[idx // 3, idx % 3].set_ylabel('Survival Probability')
-        axes[idx // 3, idx % 3].legend()
+    
+        if colval == 1 or rowval == 1:
+            kmf[idx].fit(durations=hi_df['Time'], event_observed=hi_df['Status'], label=f'hi n={len(hi_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx])
+            kmf[idx].fit(durations=lo_df['Time'], event_observed=lo_df['Status'], label=f'lo n={len(lo_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx])
+
+            results = logrank_test(durations_A=hi_df['Time'], durations_B=lo_df['Time'], event_observed_A=hi_df['Status'], event_observed_B=lo_df['Status'])
+            print(f"\nlog rank of group: {list(stranslate.keys())[idx]}")
+            results.print_summary()
+            print('=' * 30)
+            
+            axes[idx].set_title(f'Kaplan-Meier Estimates by Group, {list(stranslate.keys())[idx]}')
+            axes[idx].set_xlabel('Time')
+            axes[idx].set_ylabel('Survival Probability')
+            axes[idx].legend()
+        else:
+            kmf[idx].fit(durations=hi_df['Time'], event_observed=hi_df['Status'], label=f'hi n={len(hi_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx // colval, idx % colval])
+            kmf[idx].fit(durations=lo_df['Time'], event_observed=lo_df['Status'], label=f'lo n={len(lo_df.index)}')
+            kmf[idx].plot_survival_function(ax=axes[idx // colval, idx % colval])
+
+            results = logrank_test(durations_A=hi_df['Time'], durations_B=lo_df['Time'], event_observed_A=hi_df['Status'], event_observed_B=lo_df['Status'])
+            print(f"\nlog rank of group: {list(stranslate.keys())[idx]}")
+            results.print_summary()
+            print('=' * 30)
+            
+            axes[idx // colval, idx % colval].set_title(f'Kaplan-Meier Estimates by Group, {list(stranslate.keys())[idx]}')
+            axes[idx // colval, idx % colval].set_xlabel('Time')
+            axes[idx // colval, idx % colval].set_ylabel('Survival Probability')
+            axes[idx // colval, idx % colval].legend()
 
     plt.subplots_adjust(hspace=1.5)
     
     fig.show()
-    
+
+#def SurvivalGroupsHistogram():
+''' Stratify by uniform genetic expression => kstrat 
+    Aggregate pt number, multiply by kstrat to get actual expression range
+'''
+
+
+
+#def PlotSurvivalCurves():
+
+
 # Pa = A(A^T * A)^(-1) * A^T
 # eventually do PCA
 #def ProjectPatientData():
     # set up colum vectors of patient gene expression
 
-
-#def UMAPPatientData(expressiontype):
-    # create pt data matrix using pandas dataframes
-#    for pt in TCGA_Patients:
-        
-
-        
-    # remove columns with zero or leave it
+def GetGeneNamefromTCGAGene(gene):
+    return gene[:gene.find('|')]
 
 #TODO: target 
 def _psRNATargetGetPredictionSet():
@@ -1894,8 +2828,6 @@ def GenerateExcelOfPredTar(mirna):
             if gene in value:
                 numalgs += 1
                 agg += value.index(gene)
-        if gene == 'TSPAN12|23554':
-            print("numalgs: %i agg: %i", numalgs, agg)
         
         if not numalgs == 0:
            lists[numalgs-1][gene] = agg
@@ -1909,6 +2841,171 @@ def GenerateExcelOfPredTar(mirna):
 
     wb.save(filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=(("excel file", "*.xlsx"),("All Files", "*.*") )))
 
+def GetMirList():
+    global GeneList
+    
+    returnVal = []
+    for gene in GeneList:
+        if gene[0:3] == 'hsa':
+            returnVal.append(gene)
+
+    return returnVal
+
+# do UMAP on miRNA expression with clinical staging and ulceration status
+def UMAPStagingMIRNAs(clinicalfeature, genes, expressiontype):
+    # colums are genes of interest, then our clinical featuremain
+    #mirs = ['hsa-mir-196b', 'hsa-mir-223', 'hsa-mir-135b', 'hsa-mir-363']
+    mirs = genes
+
+    # fill up our rows (faster to create temp rows and pass them to the df
+    ptdatas = {x : [] for x in (mirs + ['feature'])}
+    for pt in TCGA_Patients:
+        # append staging (last array)
+        stage = pt.GetClinicalFeature(clinicalfeature)
+        if stage is None:
+            continue
+        ptdatas['feature'].append(stage)
+        
+        for idx,mir in enumerate(mirs):
+            val = pt.GetExpressionValue(mir, expressiontype)
+
+            # if we encounter missing data, just remove patient from group
+            if val is None:
+                ptdatas['feature'].pop()
+                for idx2 in range(idx-1):
+                    ptdatas[mirs[idx2]].pop()
+                break
+            
+            ptdatas[mir].append(float(val))
+            
+    pdb.set_trace()
+
+    
+    df = pd.DataFrame(ptdatas)
+    print(df)
+
+    puredata = df[mirs].values
+    scaled_puredata = StandardScaler().fit_transform(puredata)
+
+    reducer = umap.UMAP()
+    #transformed = reducer.fit_transform(puredata)
+    transformed = reducer.fit_transform(scaled_puredata)
+
+    
+    fig,ax = plt.subplots()
+    
+    # generate feature -> int map for color pallete
+    featuremap = {x : idx for idx,x in enumerate(df.feature.value_counts().index.tolist())}
+    ax.scatter(transformed[:,0], transformed[:,1],
+                c=[sns.color_palette("husl", len(featuremap))[x] for x in df.feature.map(featuremap)])
+    ax.set_title(f'UMAP of melanoma miRNA expression colored by {clinicalfeature}')
+
+    fig.show()
+
+# train and test a clasifier
+# use component vectors to find genes of interest
+# 50% accurate give or take, basically a guess...
+# mirlist - list of miRNA's that we are investigating
+def LDAmiRUlceration(mirList, expressiontype):
+    global TCGA_Patients
+    
+    dict_targets = {1 : "Ulcerated", 0 : "Non-Ulcerated"}
+    
+    # fill np array with patient data
+    mirvalues = []
+    classes = []
+    for pt in TCGA_Patients:
+        geneexps = []
+        if pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'yes':
+            for mir in mirList:
+                if pt.CheckGeneDict(mir, expressiontype):
+                    geneexps.append(float(pt.GetExpressionValue(mir, expressiontype)))
+                else:
+                    geneexps.clear()
+                    break
+            if len(geneexps) == 0: # check if array is empty
+                continue
+            mirvalues.append(geneexps)
+            classes.append(1)
+        elif pt.ClinicalFeatures['melanoma_ulceration_indicator'] == 'no':
+            for mir in mirList:
+                if pt.CheckGeneDict(mir, expressiontype):
+                    geneexps.append(float(pt.GetExpressionValue(mir, expressiontype)))
+                else:
+                    geneexps.clear()
+                    break
+                
+            if len(geneexps) == 0: # check if array is empty
+                continue
+            mirvalues.append(geneexps)
+            classes.append(0)
+
+    # split test and training set
+    lda_train_values, lda_test_values, lda_train_classes, lda_test_classes = train_test_split(mirvalues, classes, test_size=0.2, random_state=42)
+
+
+    # create classifier object and fit model
+    clf = LinearDiscriminantAnalysis()
+    #clf = QuadraticDiscriminantAnalysis()
+    print(f"Values: {len(mirvalues)}")
+    print(f"CLasses: {len(classes)}")
+    clf.fit(np.array(lda_train_values), np.array(lda_train_classes))
+
+
+    print(clf.score(np.array(lda_test_values), np.array(lda_test_classes)))
+
+    print(mirList)
+    print(clf.coef_)
+    print(clf.explained_variance_ratio_)
+
+
+def CarsonLabGeneNameMiRFix(gene):
+    # tack off -Xp|0 at end of name
+    if 'p' in gene:
+        # last 4 letters
+        return gene[:-5]
+    else:
+        return gene[:-2]
+        
+    
+# gets GEO as a df where each column is expression of a sample
+def GetGEOData(geoid, gpl, genenamefix=None):
+    gseseries = GEOparse.get_GEO(geo=geoid, destdir='./Downloads')
+
+    # first we need to merge all data so gather list of common genes between all gsms
+    # this works, don't try to optimize it or whatever
+    templist = next(iter(gseseries.gsms.items())).table['ID_REF'].tolist()
+    commongenes = []
+    for gene in templist:
+        commongenes.append(gene)
+        for key,item in gseseries.gsms.items():
+            # I know we iterate over one twice
+            if gene not in item.table['ID_REF'].tolist():
+                commongenes.pop()
+
+
+    # merge gsms
+    
+
+    # fix commongenes
+    FinalGenes = []
+    if genenamefix is not None:
+        for gene in commongenes:
+            FinalGenes.append(genenamefix(gene))
+'''    
+# enrichment analysis on the differential expression of two genes
+# each df should be a pandas DataFrame where one column is one patient
+def KEGGEnrichmentAnalysis(ad1 : ad.AnnData, ad2 : ad.AnnData):
+    # take the mean fold change of patients
+    '''
+
+default_pathways = []
+# same thing but with TCGA data
+#def KEGGEnrichmentAnalysisTCGA(genes, stratificiation_metric, pathwayconfig=None):
+    # first get anndata object by populating matrix with expression data
+    
+    
+#def PCAStagingMIRNAs():
     
 # dictionary to match webstites to parser algorithms
 '''Websites = {'MirDB' : WebOperationGroup(_MirDBSubmitRequest, _MirDBParseResponse) , 'PicTar' : WebOperationGroup(_PicTarSubmitRequest, _PicTarParseResponse),
@@ -1928,8 +3025,540 @@ class WebsiteInterface:
     @staticmethod
     def GetPredictionForGene(gene, ID):
         return Websites[ID](gene)'''
+'''
+def CheckDiscrepancy(df, df2, pt_ID):
+    mirnas = df['miRNA_ID'].tolist()
+    
+    xpoints = []
+    ypoints = []
+    
+    for idx,mir in enumerate(mirnas):
+        expval = df[df['miRNA_ID'] == mir]['reads_per_million_miRNA_mapped'].iloc[0]
+        #expval2 = df2[df['miRNA_ID'] == mir]
+        xpoints.append(np.log2(expval))
+        try df2[df2[]]:
+            xpoints.pop()
+            print(mir)
+            continue
+        else:
+            ypoints.append(np.log2(float(pt.GetExpressionValue(mir, 'reads_per_million_miRNA_mapped'))))
+    
+    print(len(xpoints), len(ypoints))
+    mpl.pyplot.plot(xpoints,ypoints)
+    mpl.pyplot.show()'''
+
+
+def QueryGOFiles():
+    # check if file is available
+    gobasic_url = "https://current.geneontology.org/ontology/go-basic.obo"
+    gene2go_url = "https://raw.githubusercontent.com/tanghaibao/goatools/main/data/association"
+
+    gobasic_cachename = "gobasic_temp.obo"
+    gene2go_cachename = "gene2go_temp.tsv"
+
+    dirfiles = os.listdir(os.getcwd())
+
+    gobasic = None
+    gene2goa = None
+    
+    if gobasic_cachename not in dirfiles:
+        # cache file
+        with open(gobasic_cachename, 'w') as file:
+            r = requests.get(gobasic_url)
+            file.write(r.text)
+        
+    gobasic = GODag(gobasic_cachename)
+
+    if gene2go_cachename not in dirfiles:
+        # cache file
+        with open(gene2go_cachename, 'w') as file:
+            r = requests.get(gene2go_url)
+            file.write(r.text)
+        
+    gene2goa = IdToGosReader(gene2go_cachename, godag=gobasic)
+
+    return (gobasic, gene2goa)
+
+def GOEnrichmentAnalysis(geneinterests):#, globallist):
+    # retrieve go files (ontoloy and gene2go)
+    gobasic, gene2goa = QueryGOFiles()
+
+    #fix gene lists, tack of the ID at the end
+    for idx,gene in enumerate(geneinterests):
+        geneinterests[idx] = gene[:gene.find('|')]
+
+    #for idx,gene in enumerate(globallist):
+    #    globallist[idx] = gene[:gene.find('|')]
+
+    temp = geneinterests.copy()
+    # perform enrichment
+    goeaobj = GOEnrichmentStudy(
+    temp,
+    gene2goa.get_id2gos(),
+    gobasic,
+    obsolete='replace',
+    methods=['bonferroni', 'fdr_bh'],
+    pvalcalc='fisher_scipy_stats')
+
+    return goeaobj
+
+# df is either neg or pos, indicating negative or positive correlation. Siggroup is the significant group
+def GetDifferentialCC_UvNU(data, siggroup, df):
+    global GeneList
+
+    dfmap = {'neg' : -1, 'pos' : 1}
+    factor = 0
+    try:
+        factor = dfmap[df]
+    except:
+        print('invalid value was passed for df, it should either be neg or pos!')
+        return
+
+    returnVal = []
+    
+    for gene in GeneList:
+        datas = data.SearchForGene(gene)
+
+        # dumb and dangerous fix later
+        try:
+            Udata = datas.FilterForMetadata('melanoma_ulceration_indicator', 'yes').Data[0]
+            NUdata = datas.FilterForMetadata('melanoma_ulceration_indicator', 'no').Data[0]
+        except:
+            continue
+
+        
+        if siggroup == 'ulcerated':
+            if Udata.pval < .05 and Udata.CorCoeff * factor > 0 and NUdata.pval > 0.05:
+                returnVal.append((gene, Udata.CorCoeff))
+        elif siggroup == 'non-ulcerated':
+            if NUdata.pval < .05 and NUdata.CorCoeff * factor > 0 and Udata.pval > 0.05:
+                returnVal.append((gene, NUdata.CorCoeff))
+        else:
+            print(f'Invalid value {siggroup} was passed for siggroup, it should be either ulcerated or non-ulcerated!')
+            return
+
+    return returnVal
+
+# min_dcc is the minimun change in correlation coefficient between the two groups
+def FindGenesToStratifyUlcerationCCForGene(genelist, stratgene, min_dcc):
+    expressionlist = [GuessExpressionType(gene) for gene in genelist]
+    processeddata = ExpressionDataContainer(ProcessGeneListForClinicalFeature(stratgene, GuessExpressionType(stratgene), genelist, expressionlist, 'melanoma_ulceration_indicator'))
+
+    returnVal = []
+
+    for gene in genelist:
+        tempdata = processeddata.SearchForGene(gene)
+
+        try:
+            Udata = tempdata.FilterForMetadata('melanoma_ulceration_indicator', 'yes')
+            NUdata = tempdata.FilterForMetadata('melanoma_ulceration_indicator', 'no')
+        except:
+            continue
+
+        if len(Udata.Data[0].IValues) < 40 or len(NUdata.Data[0].IValues) < 40:
+            continue
+        
+        if len(Udata.Data) != 1 or len(NUdata.Data) != 1:
+            continue
+
+        if Udata.Data[0].pval > .05 and NUdata.Data[0].pval > .05 and abs(Udata.Data[0].CorCoeff - NUdata.Data[0].CorCoeff) > min_dcc:
+            returnVal.append(gene)
+
+    return returnVal
+
+def FindGenesWithHighCC(genelist, stratgene, mincc):
+    expressionlist = [GuessExpressionType(gene) for gene in genelist]
+    processeddata = ExpressionDataContainer(ProcessGenesForGeneList(stratgene, GuessExpressionType(stratgene), genelist, expressionlist))
+
+    returnVal = []
+
+    for data in processeddata.Data:
+        if len(data.IValues) < 40:
+            continue
+
+        if abs(data.CorCoeff) > mincc and data.pval < .05:
+            returnVal.append((data.DGene, data.CorCoeff))
+
+    return returnVal
+
+def GetCCSortedByPval(datas):
+    returnVal = []
+    for data in datas:
+        if data.pval < .05:
+            returnVal.append((data.DGene, data.CorCoeff, data.pval))
+
+    return sorted(returnVal, key=lambda x: x[2])
+
+
+class BasicMAFEntry:
+    def __init__(self, ptID, # patient ID
+                 gene, # gene name
+                 mutation_type, # mutation (nonsense, missense, etc.
+                 nucleotide_poly): # polymorphism (SNP, DEL, etc.)
+        self.ptID = ptID
+        self.gene_name = gene
+        self.mutation_type = mutation_type
+        self.nucelotide_poly = nucleotide_poly
+
+
+class MAFPatient:
+    def __init__(self, ptID,
+                 entries : list):
+        self.ptID = ptID
+        self.entries = entries
+
+
+    def GetMutationTypeOfGene(self, gene):
+        l = [x.mutation_type for x in self.entries if x.gene_name == gene]
+        return list(set(l))
+
+
+    def CreateGeneList(self):
+        genelist = []
+        for entry in self.entries:
+            genelist.append(entry.gene_name)
+        
+        return list(set(genelist))
+
+def GetMAFPatient(ptID, maflist):
+    for l in maflist:
+        if l.ptID == ptID:
+            return l
+    return None
+
+    
+def LoadMutationsFromFile(filename=None):
+    maf_file = ""
+    
+    if filename is None:
+        maf_file = filedialog.askopenfilename(defaultextension='.txt', title="Select File for mutation", filetypes=(("Mutation Annotation Format", "*.maf"),("Text File", "*.txt") ))
+    else:
+        maf_file = filename
+
+    df = pd.read_csv(maf_file,sep='\t')
+
+    ptID = GetPatientID(df.iloc[0]['Tumor_Sample_Barcode'])
+    
+    entries = []
+    
+    for idx,row in df.iterrows():
+        if ptID != GetPatientID(row['Tumor_Sample_Barcode']):
+            print('Multiple patients from MAF file!')
+        
+        #create MAF entry
+        entries.append(BasicMAFEntry(GetPatientID(row['Tumor_Sample_Barcode']),
+                                     row['Hugo_Symbol'] + '|' + str(row['Entrez_Gene_Id']),
+                                     row['Variant_Classification'],
+                                     row['Variant_Type']))
+        
+    return MAFPatient(ptID, entries)
+
+def LoadMutationsFromDir():
+    maf_dir = filedialog.askdirectory(title="Select MAF directory")
+
+    patients = []
+
+    for root, _, files in os.walk(maf_dir):
+        with alive_bar(len(files)) as bar:
+            for filename in files:
+                # check if this is indeed an maf file
+                if filename.find('.maf') == -1:
+                    bar()
+                    continue
+                print(f'Loading: {maf_dir}/{filename}')
+                try:
+                    patients.append(LoadMutationsFromFile(maf_dir + '/' + filename))
+                    bar()
+                except:
+                    print(f"\033[91mFailed to load MAF file: {maf_dir}/{filename}!\033[0m")
+                    bar()
+                    
+    return patients
     
 
+'''def GetAllPossibleMutationTypesOfGene(patientlist, gene):
+    mutation_types = []
+    
+    for l in patientlist:
+        if l.GetMutationTypeOfGene(gene) not in mutation_types:
+            mutation_types.append(l.GetMutationTypeOfGene(gene))
+
+    if None in mutation_types:
+        print("Multiple mutation types present in one patient!")
+
+    return mutation_types'''
+    
+def MutationNumber(patientlist, gene, Filter = None, stratification_factor=None, plot : bool = True):
+    if not stratification_factor:
+        mutationdict = {}
+        if Filter is not None:
+                mutationdict = {x : 0 for x in Filter}
+
+        mutationdict['No Mutation'] = 0
+        
+        for l in patientlist:
+            
+            mutation_type_l = l.GetMutationTypeOfGene(gene)
+
+            if not mutation_type_l:
+                mutationdict['No Mutation'] += 1
+                continue
+
+            for mutation_type in mutation_type_l:
+                if Filter is None:
+                    if mutation_type not in mutationdict.keys():
+                        mutationdict[mutation_type] = 1
+                    else:
+                        mutationdict[mutation_type] += 1
+                else:
+                    if mutation_type in mutationdict.keys():
+                        mutationdict[mutation_type] += 1
+
+        if plot is False:
+            return mutationdict
+
+        fig,ax = plt.subplots()
+        graphstart=0
+
+        for key,item in mutationdict.items():
+            ax.bar(gene, item, bottom=graphstart, label=key)
+            graphstart += item
+            
+        ax.set_title("Mutation Count")
+        ax.legend()
+
+        plt.show()
+
+        return mutationdict
+    else:
+        cvalues = GetPossibleFeatureValues(stratification_factor)
+        
+        mutationdicts = None
+        
+        if Filter is not None:
+            Filter.append('No Mutation')
+            mutationdicts = {x : {x : 0 for x in Filter} for x in cvalues}
+        else:
+            mutationdicts = {x : {'No Mutation' : 0} for x in cvalues}
+        
+        for l in patientlist:
+            pt = GetPatient(l.ptID)
+            feature_val = None
+            
+            if pt is None:
+                continue
+
+            feature_val = pt.GetClinicalFeature(stratification_factor)
+
+            if feature_val is None:
+                continue
+            
+            mutation_type_l = l.GetMutationTypeOfGene(gene)
+
+            if not mutation_type_l:
+                mutationdicts[feature_val]['No Mutation'] += 1
+                continue
+
+            for mutation_type in mutation_type_l:
+                if Filter is None:
+                    if mutation_type not in mutationdicts[feature_val].keys():
+                        mutationdicts[feature_val][mutation_type] = 1
+                    else:
+                        mutationdicts[feature_val][mutation_type] += 1
+                else:
+                    if mutation_type in mutationdicts[feature_val].keys():
+                         mutationdicts[feature_val][mutation_type] += 1
+
+        if plot is False:
+            return mutationdicts
+
+        fig,ax = plt.subplots()
+
+        # get unique list of all mutation types
+        mutationtypes = []
+        for key0,d in mutationdicts.items():
+            mutationtypes += list(d.keys())
+
+        mutationtypes_unique = list(set(mutationtypes))
+
+        tempcolors = randomcolor.RandomColor().generate(count=len(mutationtypes_unique))
+        colormap = {x : tempcolors[idx] for idx,x in enumerate(mutationtypes_unique)}
+        
+        for key0,d in mutationdicts.items():
+            tempbottom=0
+            for key1,item in d.items():
+                ax.bar(key0, item, bottom=tempbottom, color=colormap[key1], label=key1)
+                tempbottom += item
+
+        handles, labels = ax.get_legend_handles_labels()
+        
+        ax.set_title("Mutation Count")
+        ax.legend(handles[0:len(mutationtypes_unique)], labels[0:len(mutationtypes_unique)])
+
+        plt.show()
+
+        return mutationdicts
+        
+Critical_Mutation_List = ['Missense_Mutation', 'Nonsense_Mutation', 'Frame_Shift_Del', 'Frame_Shift_Ins', 'Splice_Site']
+
+def AppendSimpleClinicalFeatureForGeneMutation(genelist : list, maflist, Filter, featurename):
+    global TCGA_Patients
+    
+    for pt in TCGA_Patients:
+        maf = GetMAFPatient(pt.ID, maflist)
+
+        if not maf:
+            continue
+
+        nomut = True
+        for gene in genelist:
+            if len(set(maf.GetMutationTypeOfGene(gene)) & set(Filter)) != 0:
+                pt.AppendClinicalFeature(featurename, 'yes')
+                nomut = False
+                break
+
+        if nomut:
+            pt.AppendClinicalFeature(featurename, 'no')
+
+def AppendAdvancedClinicalFeatureForGeneMutation(genelist, maflist, Filter, featurename):
+    global TCGA_Patients
+    
+    for pt in TCGA_Patients:
+        maf = GetMAFPatient(pt.ID, maflist)
+
+        if not maf:
+            continue
+
+        nomut = True
+        for gene in genelist:
+            if len(set(maf.GetMutationTypeOfGene(gene)) & set(Filter)) != 0:
+                pt.AppendClinicalFeature(featurename, maf.GetMutationTypeOfGene(gene))
+                nomut = False
+                break
+
+        if nomut:
+            pt.AppendClinicalFeature(featurename, 'No Mutation')
+
+def GetMAFListGeneList(maflist):
+    genelist = []
+    for maf in maflist:
+        genelist += maf.CreateGeneList()
+    
+    return list(set(genelist))
+
+def SortUlcerationMutationDifferential(maflist):
+    genelist = GetMAFListGeneList(maflist)
+
+    returnVal = []
+
+    with alive_bar(len(genelist)) as bar:
+        for gene in genelist:
+            tempmut = MutationNumber(maflist, gene, stratification_factor='melanoma_ulceration_indicator', Filter = Critical_Mutation_List, plot = False)
+
+            Ucount = 0
+            NUcount = 0
+
+            for key,item in tempmut['no'].items():
+                if key == "No Mutation":
+                    continue
+                NUcount += item
+
+            for key,item in tempmut['yes'].items():
+                if key == "No Mutation":
+                    continue
+                Ucount += item
+
+            returnVal.append((gene, Ucount - NUcount))
+
+            bar()
+
+    return sorted(returnVal, key=lambda x: x[1], reverse=True)
+
+def LoadMethylationData():
+    # create anndata and load B values into itmain
+    # load datadframe, transpose, convert to np.matrix, load into AnnData
+    df = pd.read_csv(filedialog.askopenfilename(title = "Select Firebrowse methylation mean data", defaultextension='.txt', filetypes=(("text file", "*.txt"),("comma seperated values file", "*.csv"),("All Files", "*.*") )), sep='\t')
+
+    df = df[1:]
+    df.set_index("Hybridization REF", inplace=True)
+
+    adata = ad.AnnData(df.transpose())
+    
+    adata.obs_names = [x[:12] for x in adata.obs.index.tolist()]
+
+    # filter duplicates
+    duplicates = adata.obs_names.duplicated(keep='first')
+    
+    return adata[~duplicates,:]
+
+def PlotMethylationDataForClinicalFeature(gene, feature, data, nullgroup, plot=True):
+    adata = data[:,gene]
+    featurevals = BuildFeatureList(feature)
+    
+    if not featurevals:
+        print(f"clinical feature {feature} is not present within patient data!")
+        return
+
+    # filter for featurevals present within the data matrix we were passed
+    for k,l in featurevals.items():
+        featurevals[k] = list(set(featurevals[k]) & set(adata.obs.index.tolist()))
+
+    
+    methyldata = {x : list(adata[featurevals[x],:][:,gene].X.astype(float).flat) for x in featurevals.keys()}
+
+    if not plot:
+        ttestvals = {}
+        enriched = {}
+        for k,v in methyldata.items():
+            if k == nullgroup:
+                continue
+
+            ttestvals[k] = scipy.stats.ttest_ind(methyldata[nullgroup], v)
+            enriched[k] = np.mean(methyldata[nullgroup]) < np.mean(v)
+        return (ttestvals, enriched)
+
+    fig,ax = plt.subplots()
+
+    ax.boxplot([v for k,v in methyldata.items()], tick_labels=featurevals.keys())
+
+    ttestvals = {}
+    enriched = {}
+    for k,v in methyldata.items():
+        if k == nullgroup:
+            continue
+        
+        ttestvals[k] = scipy.stats.ttest_ind(methyldata[nullgroup], v)
+        enriched[k] = np.mean(methyldata[nullgroup]) < np.mean(v)
+    print((ttestvals, enriched))
+    plt.show()
+
+    return (ttestvals, enriched)
+
+# df = hi means methylation is higher, lo means lower
+def FindMethylationDiffForUlceration(ptlist, df):
+    global GeneList
+    
+    adata = LoadMethylationData()
+    adata = adata[ptlist,:]
+
+    returnVal = []
+    with alive_bar(len(GeneList)) as bar:
+        for gene in GeneList:
+            try:
+                ttest,enriched = PlotMethylationDataForClinicalFeature(gene[:gene.find('|')], 'melanoma_ulceration_indicator', adata, 'no', plot=False)
+                if ttest['yes'].pvalue < .05:
+                    if df == 'hi' and enriched:
+                        returnVal.append(gene)
+                    elif df == 'lo' and not enriched:
+                        returnVal.append(gene)
+                bar()
+            except:
+                #print(gene[:gene.find('|')])
+                bar()
+                continue
+
+
+    return returnVal
 #Restore('patientsave.pickle')
 #mrna_df = ImportTCGAData('TCGA_SKCM_mRNA_9.29.23.csv')
 #StoreEverything(mrna_df)
